@@ -3,7 +3,9 @@ import time
 import json
 import re
 import random
+import logging
 from enum import Enum
+from datetime import datetime, timedelta
 
 import feedparser
 from binance.client import Client
@@ -13,6 +15,13 @@ from dotenv import load_dotenv
 from sentiment import get_sentiment, Signal
 
 load_dotenv()
+
+# ==================== LOGGING SETUP ====================
+logging.basicConfig(
+    filename='trading_bot.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # ==================== CONFIG ====================
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
@@ -27,17 +36,14 @@ MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "5.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
-# RSS feed for oil news (Reuters via Google News)
 RSS_URL = os.getenv("RSS_URL", "https://news.google.com/rss/search?q=crude+oil+OPEC+WTI+Brent&hl=en-US&gl=US&ceid=US:en")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds between RSS checks
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 
-# Binance keys
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
-# ==================== FuturesAccount (unchanged) ====================
+# ==================== FuturesAccount ====================
 class FuturesAccount:
-    # ... exactly the same as your original code ...
     def __init__(self, initial_balance):
         self.cash = initial_balance
         self.position = 0.0
@@ -69,11 +75,15 @@ class FuturesAccount:
     def open_position(self, side, amount, price):
         position_value = amount * price
         if position_value < MIN_NOTIONAL:
-            print(f"[ERROR] Position value ${position_value:.2f} below min notional. Rejected.")
+            msg = f"Position value ${position_value:.2f} below min notional. Rejected."
+            print(f"[ERROR] {msg}")
+            logging.error(msg)
             return None
         margin_req = position_value / self.leverage
         if not self.can_open(margin_req):
-            print("[ERROR] Not enough free margin.")
+            msg = "Not enough free margin."
+            print(f"[ERROR] {msg}")
+            logging.error(msg)
             return None
         self.cash -= margin_req
         self.margin_used += margin_req
@@ -89,7 +99,9 @@ class FuturesAccount:
             self.entry_price = price
         fee = position_value * FEE_RATE
         self.cash -= fee
-        print(f"[ACCOUNT] Opened. Margin: ${margin_req:.2f} | Free: ${self.free_margin:.2f}")
+        msg = f"Opened. Margin: ${margin_req:.2f} | Free: ${self.free_margin:.2f}"
+        print(f"[ACCOUNT] {msg}")
+        logging.info(msg)
         return True
 
     def close_position(self, price):
@@ -107,7 +119,9 @@ class FuturesAccount:
         self.position = 0
         self.entry_price = None
         self.realized_pnl += pnl
-        print(f"[CLOSE LONG] PnL: ${pnl:.2f} | Fee: ${fee:.2f}")
+        msg = f"CLOSE LONG - PnL: ${pnl:.2f} | Fee: ${fee:.2f}"
+        print(f"[{msg}]")
+        logging.info(msg)
 
     def _close_short_internal(self, price):
         amount = -self.position
@@ -118,112 +132,164 @@ class FuturesAccount:
         self.position = 0
         self.entry_price = None
         self.realized_pnl += pnl
-        print(f"[CLOSE SHORT] PnL: ${pnl:.2f} | Fee: ${fee:.2f}")
+        msg = f"CLOSE SHORT - PnL: ${pnl:.2f} | Fee: ${fee:.2f}"
+        print(f"[{msg}]")
+        logging.info(msg)
 
 
-# ==================== OIL BOT (sync) ====================
+# ==================== OIL BOT ====================
 class OilBot:
     def __init__(self):
         self.client = None
         self.account = FuturesAccount(INITIAL_CAPITAL)
         self.last_trade_time = 0
         self.active_symbol = SYMBOL
-        self.seen_guids = set()   # to avoid processing same news twice
+        self.seen_guids = set()
+        self.max_guids = 10000
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 5
 
     def init_binance(self):
-        """Connect to Binance Futures Testnet."""
-        self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
-        # Check symbol availability
+        """Connect to Binance Futures Testnet - FIXED."""
         try:
+            # CORRECT: Use Futures Demo URL, NOT Spot testnet
+            self.client = Client(BINANCE_API_KEY, BINANCE_SECRET)
+            self.client.API_URL = 'https://demo-fapi.binance.com/fapi/v1'
+            self.client.WEBSOCKET_URL = 'wss://demo-fstream.binance.com/ws'
+            
+            # Test connection
             info = self.client.futures_exchange_info()
             symbols = [s['symbol'] for s in info['symbols']]
             if self.active_symbol not in symbols:
                 print(f"[WARN] {self.active_symbol} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
+                logging.warning(f"{self.active_symbol} not found. Trying fallback.")
                 if FALLBACK_SYMBOL not in symbols:
                     print(f"[CRITICAL] Neither symbol found. Exiting.")
+                    logging.critical("No valid symbols found.")
                     exit(1)
                 self.active_symbol = FALLBACK_SYMBOL
-            print(f"[INIT] Using symbol: {self.active_symbol}")
+            print(f"[INIT] Connected to Futures Demo. Using symbol: {self.active_symbol}")
+            logging.info(f"Connected to Futures Demo. Symbol: {self.active_symbol}")
         except Exception as e:
-            print(f"[ERROR] Cannot fetch exchange info: {e}")
+            print(f"[ERROR] Cannot connect to Binance Futures Demo: {e}")
+            logging.error(f"Connection failed: {e}")
             exit(1)
 
-        # Set leverage
-        try:
-            self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
-        except Exception as e:
-            print(f"[WARN] Could not set leverage: {e}")
+        # Set leverage with retry
+        for attempt in range(3):
+            try:
+                self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
+                logging.info(f"Leverage set to {LEVERAGE}x")
+                break
+            except Exception as e:
+                print(f"[WARN] Leverage attempt {attempt+1} failed: {e}")
+                time.sleep(1)
 
     def fetch_price(self):
-        """Get current mark price."""
-        try:
-            ticker = self.client.futures_symbol_ticker(symbol=self.active_symbol)
-            return float(ticker['price'])
-        except:
+        """Get current mark price with retry."""
+        for attempt in range(3):
             try:
-                mark = self.client.futures_mark_price(symbol=self.active_symbol)
-                return float(mark['markPrice'])
-            except Exception as e:
-                print(f"[ERROR] Price fetch failed: {e}")
-                return None
+                ticker = self.client.futures_symbol_ticker(symbol=self.active_symbol)
+                return float(ticker['price'])
+            except:
+                try:
+                    mark = self.client.futures_mark_price(symbol=self.active_symbol)
+                    return float(mark['markPrice'])
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(0.5)
+                    else:
+                        print(f"[ERROR] Price fetch failed: {e}")
+                        logging.error(f"Price fetch failed: {e}")
+                        return None
+        return None
 
     def place_market_order(self, side, quantity):
-        """Synchronous MARKET order."""
-        try:
-            order = self.client.futures_create_order(
-                symbol=self.active_symbol,
-                side=side,
-                type=FUTURE_ORDER_TYPE_MARKET,
-                quantity=round(quantity, 3)
-            )
-            print(f"[MARKET ORDER] {order}")
-            return order
-        except Exception as e:
-            print(f"[MARKET ORDER ERROR] {e}")
-            return None
+        """Synchronous MARKET order with retry."""
+        for attempt in range(3):
+            try:
+                order = self.client.futures_create_order(
+                    symbol=self.active_symbol,
+                    side=side,
+                    type=FUTURE_ORDER_TYPE_MARKET,
+                    quantity=round(quantity, 3)
+                )
+                print(f"[MARKET ORDER] {order}")
+                logging.info(f"MARKET ORDER: {order}")
+                return order
+            except Exception as e:
+                print(f"[MARKET ORDER ERROR] Attempt {attempt+1}: {e}")
+                if attempt < 2:
+                    time.sleep(1)
+                else:
+                    logging.error(f"Market order failed: {e}")
+                    return None
+        return None
 
     def place_stop_order(self, side, quantity, stop_price):
-        """Synchronous STOP_MARKET order."""
-        try:
-            order = self.client.futures_create_order(
-                symbol=self.active_symbol,
-                side=side,
-                type=FUTURE_ORDER_TYPE_STOP_MARKET,
-                quantity=round(quantity, 3),
-                stopPrice=round(stop_price, 2)
-            )
-            print(f"[STOP LOSS] {order}")
-            return order
-        except Exception as e:
-            print(f"[STOP ORDER ERROR] {e}")
-            return None
+        """Synchronous STOP_MARKET order with retry."""
+        for attempt in range(3):
+            try:
+                order = self.client.futures_create_order(
+                    symbol=self.active_symbol,
+                    side=side,
+                    type=FUTURE_ORDER_TYPE_STOP_MARKET,
+                    quantity=round(quantity, 3),
+                    stopPrice=round(stop_price, 2)
+                )
+                print(f"[STOP LOSS] {order}")
+                logging.info(f"STOP LOSS: {order}")
+                return order
+            except Exception as e:
+                print(f"[STOP ORDER ERROR] Attempt {attempt+1}: {e}")
+                if attempt < 2:
+                    time.sleep(1)
+                else:
+                    logging.error(f"Stop order failed: {e}")
+                    return None
+        return None
 
     def place_tp_order(self, side, quantity, tp_price):
-        """Synchronous TAKE_PROFIT_MARKET order."""
-        try:
-            order = self.client.futures_create_order(
-                symbol=self.active_symbol,
-                side=side,
-                type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                quantity=round(quantity, 3),
-                stopPrice=round(tp_price, 2)
-            )
-            print(f"[TAKE PROFIT] {order}")
-            return order
-        except Exception as e:
-            print(f"[TP ORDER ERROR] {e}")
-            return None
+        """Synchronous TAKE_PROFIT_MARKET order with retry."""
+        for attempt in range(3):
+            try:
+                order = self.client.futures_create_order(
+                    symbol=self.active_symbol,
+                    side=side,
+                    type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
+                    quantity=round(quantity, 3),
+                    stopPrice=round(tp_price, 2)
+                )
+                print(f"[TAKE PROFIT] {order}")
+                logging.info(f"TAKE PROFIT: {order}")
+                return order
+            except Exception as e:
+                print(f"[TP ORDER ERROR] Attempt {attempt+1}: {e}")
+                if attempt < 2:
+                    time.sleep(1)
+                else:
+                    logging.error(f"TP order failed: {e}")
+                    return None
+        return None
 
     def execute_trade(self, signal):
-        """Execute trade based on signal (same logic as original)."""
+        """Execute trade based on signal."""
         now = time.time()
         if now - self.last_trade_time < COOLDOWN_SECONDS:
-            print(f"[COOLDOWN] Wait {COOLDOWN_SECONDS - (now - self.last_trade_time):.1f}s")
+            wait = COOLDOWN_SECONDS - (now - self.last_trade_time)
+            print(f"[COOLDOWN] Wait {wait:.1f}s")
             return
 
         price = self.fetch_price()
         if price is None:
+            self.consecutive_errors += 1
+            if self.consecutive_errors >= self.max_consecutive_errors:
+                print("[CRITICAL] Too many errors. Waiting 60s...")
+                time.sleep(60)
+                self.consecutive_errors = 0
             return
+        self.consecutive_errors = 0
+
         self.account.update_price(price)
 
         equity_before = self.account.total_equity
@@ -231,6 +297,7 @@ class OilBot:
         position_value = margin_to_use * LEVERAGE
         quantity = position_value / price
         print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity_before:.2f} | Size: {quantity:.4f}")
+        logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity_before:.2f}")
 
         pos = self.account.position
 
@@ -251,11 +318,13 @@ class OilBot:
                 self.place_tp_order(sl_side, quantity, tp_price)
                 self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
                 print(f"[POSITION] SL: ${sl_price:.2f} | TP: ${tp_price:.2f}")
+                logging.info(f"New position. SL: ${sl_price:.2f} | TP: ${tp_price:.2f}")
         else:
             if (pos > 0 and signal == Signal.BULL) or (pos < 0 and signal == Signal.BEAR):
                 print("[HOLD] Same direction.")
             else:
                 print("[REVERSE] Opposite signal – closing and reversing.")
+                logging.info("Reversing position")
                 close_side = SIDE_SELL if pos > 0 else SIDE_BUY
                 close_qty = abs(pos)
                 self.place_market_order(close_side, close_qty)
@@ -280,9 +349,15 @@ class OilBot:
         self.last_trade_time = time.time()
 
     def check_news(self):
-        """Fetch RSS feed, run sentiment on new headlines, trigger trade if strong signal."""
+        """Fetch RSS feed, run sentiment on new headlines."""
         print(f"[RSS] Fetching {RSS_URL}")
-        feed = feedparser.parse(RSS_URL)
+        try:
+            feed = feedparser.parse(RSS_URL)
+        except Exception as e:
+            print(f"[RSS ERROR] {e}")
+            logging.error(f"RSS fetch error: {e}")
+            return
+
         if not feed.entries:
             print("[RSS] No entries found.")
             return
@@ -293,6 +368,10 @@ class OilBot:
                 continue
             self.seen_guids.add(guid)
 
+            # Prevent memory leak - keep only last 5000 GUIDs
+            if len(self.seen_guids) > self.max_guids:
+                self.seen_guids = set(list(self.seen_guids)[-5000:])
+
             title = entry.get('title', '')
             summary = entry.get('summary', '')
             text = title + " " + summary
@@ -300,20 +379,25 @@ class OilBot:
                 continue
 
             print(f"\n[NEWS] {title}")
+            logging.info(f"NEWS: {title}")
             signal = get_sentiment(text, conflict_mode=CONFLICT_MODE)
             print(f"[SENTIMENT] {signal.value}")
+            logging.info(f"Sentiment: {signal.value}")
             if signal != Signal.NEUTRAL:
                 self.execute_trade(signal)
 
     def run(self):
-        """Main loop."""
+        """Main loop with error recovery."""
         self.init_binance()
         print("[START] News scanner active. Listening for oil headlines...")
+        logging.info("=== BOT STARTED ===")
         while True:
             try:
                 self.check_news()
             except Exception as e:
                 print(f"[ERROR] check_news: {e}")
+                logging.error(f"check_news error: {e}")
+                time.sleep(10)
             time.sleep(POLL_INTERVAL)
 
 
