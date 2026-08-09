@@ -1,4 +1,3 @@
-import asyncio
 import os
 import time
 import json
@@ -6,37 +5,39 @@ import re
 import random
 from enum import Enum
 
-import tweepy
-from binance import AsyncClient
+import feedparser
+from binance.client import Client
 from binance.enums import *
 from dotenv import load_dotenv
 
-# Import your sentiment engine and config
 from sentiment import get_sentiment, Signal
 
 load_dotenv()
 
-# ==================== CONFIG (from your original) ====================
-SYMBOL = os.getenv("SYMBOL", "BZUSDT")
-FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "WTIUSDT")
+# ==================== CONFIG ====================
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MARGIN_PERCENT = float(os.getenv("MARGIN_PERCENT", "0.5"))
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.01"))
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.01"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))
-REVERSE_ON_SIGNAL = os.getenv("REVERSE_ON_SIGNAL", "True").lower() == "true"
 MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "5.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "5"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
+
+# RSS feed for oil news (Reuters via Google News)
+RSS_URL = os.getenv("RSS_URL", "https://news.google.com/rss/search?q=crude+oil+OPEC+WTI+Brent&hl=en-US&gl=US&ceid=US:en")
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds between RSS checks
 
 # Binance keys
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
-TWITTER_BEARER = os.getenv("TWITTER_BEARER")
 
-# ==================== FuturesAccount (your exact class) ====================
+# ==================== FuturesAccount (unchanged) ====================
 class FuturesAccount:
+    # ... exactly the same as your original code ...
     def __init__(self, initial_balance):
         self.cash = initial_balance
         self.position = 0.0
@@ -120,58 +121,56 @@ class FuturesAccount:
         print(f"[CLOSE SHORT] PnL: ${pnl:.2f} | Fee: ${fee:.2f}")
 
 
-# ==================== OIL BOT (async) ====================
+# ==================== OIL BOT (sync) ====================
 class OilBot:
     def __init__(self):
-        self.client = None          # Binance AsyncClient
+        self.client = None
         self.account = FuturesAccount(INITIAL_CAPITAL)
         self.last_trade_time = 0
-        self.active_symbol = SYMBOL  # may switch to fallback
+        self.active_symbol = SYMBOL
+        self.seen_guids = set()   # to avoid processing same news twice
 
-    async def init_binance(self):
-        """Connect to Binance Futures Testnet and set leverage."""
-        self.client = await AsyncClient.create(
-            BINANCE_API_KEY, BINANCE_SECRET, testnet=True
-        )
-        # Check if symbol exists
-        exchange_info = await self.client.futures_exchange_info()
-        symbols = [s['symbol'] for s in exchange_info['symbols']]
-        if SYMBOL not in symbols:
-            print(f"[WARN] {SYMBOL} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
-            if FALLBACK_SYMBOL not in symbols:
-                print(f"[CRITICAL] Neither {SYMBOL} nor {FALLBACK_SYMBOL} found on testnet. Exiting.")
-                exit(1)
-            self.active_symbol = FALLBACK_SYMBOL
-        else:
-            self.active_symbol = SYMBOL
-        print(f"[INIT] Using symbol: {self.active_symbol}")
-
-        # Set leverage (futures only)
+    def init_binance(self):
+        """Connect to Binance Futures Testnet."""
+        self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
+        # Check symbol availability
         try:
-            await self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
+            info = self.client.futures_exchange_info()
+            symbols = [s['symbol'] for s in info['symbols']]
+            if self.active_symbol not in symbols:
+                print(f"[WARN] {self.active_symbol} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
+                if FALLBACK_SYMBOL not in symbols:
+                    print(f"[CRITICAL] Neither symbol found. Exiting.")
+                    exit(1)
+                self.active_symbol = FALLBACK_SYMBOL
+            print(f"[INIT] Using symbol: {self.active_symbol}")
+        except Exception as e:
+            print(f"[ERROR] Cannot fetch exchange info: {e}")
+            exit(1)
+
+        # Set leverage
+        try:
+            self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
         except Exception as e:
             print(f"[WARN] Could not set leverage: {e}")
 
-    async def fetch_price(self):
-        """Async price fetch using Binance ticker."""
+    def fetch_price(self):
+        """Get current mark price."""
         try:
-            ticker = await self.client.futures_symbol_ticker(symbol=self.active_symbol)
-            price = float(ticker['price'])
-            return price
-        except Exception:
-            # Fallback to REST if websocket ticker fails (rare)
+            ticker = self.client.futures_symbol_ticker(symbol=self.active_symbol)
+            return float(ticker['price'])
+        except:
             try:
-                info = await self.client.futures_mark_price(symbol=self.active_symbol)
-                price = float(info['markPrice'])
-                return price
+                mark = self.client.futures_mark_price(symbol=self.active_symbol)
+                return float(mark['markPrice'])
             except Exception as e:
                 print(f"[ERROR] Price fetch failed: {e}")
                 return None
 
-    async def place_market_order(self, side, quantity):
-        """Place a MARKET order on Binance Futures."""
+    def place_market_order(self, side, quantity):
+        """Synchronous MARKET order."""
         try:
-            order = await self.client.futures_create_order(
+            order = self.client.futures_create_order(
                 symbol=self.active_symbol,
                 side=side,
                 type=FUTURE_ORDER_TYPE_MARKET,
@@ -183,10 +182,10 @@ class OilBot:
             print(f"[MARKET ORDER ERROR] {e}")
             return None
 
-    async def place_stop_order(self, side, quantity, stop_price):
-        """Place a STOP_MARKET order (stop-loss)."""
+    def place_stop_order(self, side, quantity, stop_price):
+        """Synchronous STOP_MARKET order."""
         try:
-            order = await self.client.futures_create_order(
+            order = self.client.futures_create_order(
                 symbol=self.active_symbol,
                 side=side,
                 type=FUTURE_ORDER_TYPE_STOP_MARKET,
@@ -199,10 +198,10 @@ class OilBot:
             print(f"[STOP ORDER ERROR] {e}")
             return None
 
-    async def place_tp_order(self, side, quantity, tp_price):
-        """Place a TAKE_PROFIT_MARKET order."""
+    def place_tp_order(self, side, quantity, tp_price):
+        """Synchronous TAKE_PROFIT_MARKET order."""
         try:
-            order = await self.client.futures_create_order(
+            order = self.client.futures_create_order(
                 symbol=self.active_symbol,
                 side=side,
                 type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
@@ -215,68 +214,53 @@ class OilBot:
             print(f"[TP ORDER ERROR] {e}")
             return None
 
-    async def execute_trade(self, signal):
-        """The exact trading logic from your original main loop."""
-        current_time = time.time()
-        if current_time - self.last_trade_time < COOLDOWN_SECONDS:
-            print(f"[COOLDOWN] Skipping trade (wait {COOLDOWN_SECONDS - (current_time - self.last_trade_time):.1f}s)")
+    def execute_trade(self, signal):
+        """Execute trade based on signal (same logic as original)."""
+        now = time.time()
+        if now - self.last_trade_time < COOLDOWN_SECONDS:
+            print(f"[COOLDOWN] Wait {COOLDOWN_SECONDS - (now - self.last_trade_time):.1f}s")
             return
 
-        price = await self.fetch_price()
+        price = self.fetch_price()
         if price is None:
-            print("[ERROR] Could not fetch price, aborting trade.")
             return
         self.account.update_price(price)
 
-        # Margin & size calculation (your formula)
         equity_before = self.account.total_equity
         margin_to_use = equity_before * MARGIN_PERCENT
         position_value = margin_to_use * LEVERAGE
         quantity = position_value / price
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity_before:.2f} | Size: {quantity:.4f} contracts")
+        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity_before:.2f} | Size: {quantity:.4f}")
 
         pos = self.account.position
 
         if pos == 0:
-            # Open new position
             if signal == Signal.BULL:
                 side = SIDE_BUY
                 sl_side = SIDE_SELL
                 sl_price = price * (1 - SL_PERCENT)
                 tp_price = price * (1 + TP_PERCENT)
-            else:  # BEAR
+            else:
                 side = SIDE_SELL
                 sl_side = SIDE_BUY
                 sl_price = price * (1 + SL_PERCENT)
                 tp_price = price * (1 - TP_PERCENT)
 
-            # Place orders on Binance
-            market_ok = await self.place_market_order(side, quantity)
-            if market_ok:
-                await self.place_stop_order(sl_side, quantity, sl_price)
-                await self.place_tp_order(sl_side, quantity, tp_price)
-                # Update internal account
+            if self.place_market_order(side, quantity):
+                self.place_stop_order(sl_side, quantity, sl_price)
+                self.place_tp_order(sl_side, quantity, tp_price)
                 self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
                 print(f"[POSITION] SL: ${sl_price:.2f} | TP: ${tp_price:.2f}")
         else:
-            # Existing position
             if (pos > 0 and signal == Signal.BULL) or (pos < 0 and signal == Signal.BEAR):
-                print("[HOLD] Same direction signal. No action.")
+                print("[HOLD] Same direction.")
             else:
                 print("[REVERSE] Opposite signal – closing and reversing.")
-                # Close current position on exchange: we can place a market order of same quantity in opposite direction
-                # Binance will net the position. For simplicity, we place a reduce-only order or just a plain opposite order.
-                if pos > 0:
-                    close_side = SIDE_SELL
-                    close_qty = pos
-                else:
-                    close_side = SIDE_BUY
-                    close_qty = -pos
-                await self.place_market_order(close_side, close_qty)
-                # Update internal account
+                close_side = SIDE_SELL if pos > 0 else SIDE_BUY
+                close_qty = abs(pos)
+                self.place_market_order(close_side, close_qty)
                 self.account.close_position(price)
 
-                # Now open new position in opposite direction
                 if signal == Signal.BULL:
                     side = SIDE_BUY
                     sl_side = SIDE_SELL
@@ -288,56 +272,51 @@ class OilBot:
                     sl_price = price * (1 + SL_PERCENT)
                     tp_price = price * (1 - TP_PERCENT)
 
-                await self.place_market_order(side, quantity)
-                await self.place_stop_order(sl_side, quantity, sl_price)
-                await self.place_tp_order(sl_side, quantity, tp_price)
-                self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
+                if self.place_market_order(side, quantity):
+                    self.place_stop_order(sl_side, quantity, sl_price)
+                    self.place_tp_order(sl_side, quantity, tp_price)
+                    self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
 
-        self.last_trade_time = current_time
+        self.last_trade_time = time.time()
 
-    async def on_tweet(self, tweet):
-        """Called for every incoming tweet from the filtered stream."""
-        if tweet.referenced_tweets:  # ignore retweets, quotes, replies
-            return
-        text = tweet.text
-        if not text or len(text) < 20:
-            return
-
-        # Use your sentiment engine
-        signal = get_sentiment(text, conflict_mode=CONFLICT_MODE)
-        print(f"\n[TWEET] {text[:150]}...")
-        print(f"[SENTIMENT] {signal.value}")
-
-        if signal == Signal.NEUTRAL:
+    def check_news(self):
+        """Fetch RSS feed, run sentiment on new headlines, trigger trade if strong signal."""
+        print(f"[RSS] Fetching {RSS_URL}")
+        feed = feedparser.parse(RSS_URL)
+        if not feed.entries:
+            print("[RSS] No entries found.")
             return
 
-        await self.execute_trade(signal)
+        for entry in feed.entries:
+            guid = entry.get('id') or entry.get('link')
+            if guid in self.seen_guids:
+                continue
+            self.seen_guids.add(guid)
 
-    async def start_stream(self):
-        """Initialize Twitter filtered stream."""
-        stream = tweepy.AsyncStreamingClient(bearer_token=TWITTER_BEARER)
+            title = entry.get('title', '')
+            summary = entry.get('summary', '')
+            text = title + " " + summary
+            if len(text) < 20:
+                continue
 
-        # Clear old rules
-        rules = await stream.get_rules()
-        if rules.data:
-            await stream.delete_rules([r.id for r in rules.data])
+            print(f"\n[NEWS] {title}")
+            signal = get_sentiment(text, conflict_mode=CONFLICT_MODE)
+            print(f"[SENTIMENT] {signal.value}")
+            if signal != Signal.NEUTRAL:
+                self.execute_trade(signal)
 
-        # Rules: follow specific accounts and keywords
-        await stream.add_rules([
-            tweepy.StreamRule("from:RaoulGMI OR from:PeterLBrandt OR #OOTT OR #crude OR #WTI OR #OPEC OR #oil"),
-            tweepy.StreamRule("Brent OR crude oil OR oil prices OR energy market"),
-        ])
+    def run(self):
+        """Main loop."""
+        self.init_binance()
+        print("[START] News scanner active. Listening for oil headlines...")
+        while True:
+            try:
+                self.check_news()
+            except Exception as e:
+                print(f"[ERROR] check_news: {e}")
+            time.sleep(POLL_INTERVAL)
 
-        # Override the on_tweet callback
-        stream.on_tweet = self.on_tweet
-        print("[STREAM] Twitter stream started. Listening for oil news...")
-        await stream.filter(tweet_fields=["author_id", "created_at", "referenced_tweets"])
-
-
-async def main():
-    bot = OilBot()
-    await bot.init_binance()
-    await bot.start_stream()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    bot = OilBot()
+    bot.run()
