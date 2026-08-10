@@ -6,8 +6,8 @@ import random
 import logging
 from enum import Enum
 from datetime import datetime, timedelta
-
-import feedparser
+import requests
+import xml.etree.ElementTree as ET
 from binance.client import Client
 from binance.enums import *
 from dotenv import load_dotenv
@@ -152,12 +152,10 @@ class OilBot:
     def init_binance(self):
         """Connect to Binance Futures Testnet - FIXED."""
         try:
-            # CORRECT: Use Futures Demo URL, NOT Spot testnet
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET)
             self.client.API_URL = 'https://demo-fapi.binance.com/fapi/v1'
             self.client.WEBSOCKET_URL = 'wss://demo-fstream.binance.com/ws'
             
-            # Test connection
             info = self.client.futures_exchange_info()
             symbols = [s['symbol'] for s in info['symbols']]
             if self.active_symbol not in symbols:
@@ -175,7 +173,6 @@ class OilBot:
             logging.error(f"Connection failed: {e}")
             exit(1)
 
-        # Set leverage with retry
         for attempt in range(3):
             try:
                 self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
@@ -186,7 +183,6 @@ class OilBot:
                 time.sleep(1)
 
     def fetch_price(self):
-        """Get current mark price with retry."""
         for attempt in range(3):
             try:
                 ticker = self.client.futures_symbol_ticker(symbol=self.active_symbol)
@@ -205,7 +201,6 @@ class OilBot:
         return None
 
     def place_market_order(self, side, quantity):
-        """Synchronous MARKET order with retry."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_order(
@@ -227,7 +222,6 @@ class OilBot:
         return None
 
     def place_stop_order(self, side, quantity, stop_price):
-        """Synchronous STOP_MARKET order with retry."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_order(
@@ -250,7 +244,6 @@ class OilBot:
         return None
 
     def place_tp_order(self, side, quantity, tp_price):
-        """Synchronous TAKE_PROFIT_MARKET order with retry."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_order(
@@ -273,7 +266,6 @@ class OilBot:
         return None
 
     def execute_trade(self, signal):
-        """Execute trade based on signal."""
         now = time.time()
         if now - self.last_trade_time < COOLDOWN_SECONDS:
             wait = COOLDOWN_SECONDS - (now - self.last_trade_time)
@@ -349,32 +341,64 @@ class OilBot:
         self.last_trade_time = time.time()
 
     def check_news(self):
-        """Fetch RSS feed, run sentiment on new headlines."""
+        """Fetch RSS using requests + XML parsing (no feedparser)."""
         print(f"[RSS] Fetching {RSS_URL}")
         try:
-            feed = feedparser.parse(RSS_URL)
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            response = requests.get(RSS_URL, headers=headers, timeout=15)
+            response.raise_for_status()
         except Exception as e:
             print(f"[RSS ERROR] {e}")
             logging.error(f"RSS fetch error: {e}")
             return
 
-        if not feed.entries:
-            print("[RSS] No entries found.")
+        try:
+            root = ET.fromstring(response.content)
+            # RSS namespace
+            ns = {'': 'http://www.w3.org/2005/Atom'}
+            # Try to find items: Google RSS uses <entry> under <feed>
+            # But we can also search for <item> in RSS 2.0
+            # Let's handle both: find all <entry> or <item>
+            items = root.findall('.//entry') or root.findall('.//item')
+            if not items:
+                # Try with namespace
+                items = root.findall('.//{http://www.w3.org/2005/Atom}entry')
+            if not items:
+                print("[RSS] No entries found.")
+                return
+        except Exception as e:
+            print(f"[RSS PARSE ERROR] {e}")
+            logging.error(f"RSS parse error: {e}")
             return
 
-        for entry in feed.entries:
-            guid = entry.get('id') or entry.get('link')
+        for item in items:
+            # Extract GUID, title, summary
+            guid_elem = item.find('id') or item.find('guid') or item.find('{http://www.w3.org/2005/Atom}id')
+            guid = guid_elem.text if guid_elem is not None else None
+            if not guid:
+                link_elem = item.find('link')
+                if link_elem is not None:
+                    guid = link_elem.get('href') or link_elem.text
+            if not guid:
+                continue
+
             if guid in self.seen_guids:
                 continue
             self.seen_guids.add(guid)
 
-            # Prevent memory leak - keep only last 5000 GUIDs
+            # Prevent memory leak
             if len(self.seen_guids) > self.max_guids:
                 self.seen_guids = set(list(self.seen_guids)[-5000:])
 
-            title = entry.get('title', '')
-            summary = entry.get('summary', '')
-            text = title + " " + summary
+            title_elem = item.find('title') or item.find('{http://www.w3.org/2005/Atom}title')
+            title = title_elem.text if title_elem is not None else ''
+            summary_elem = item.find('summary') or item.find('description') or item.find('content')
+            if summary_elem is not None:
+                summary = summary_elem.text if summary_elem.text else ''
+            else:
+                summary = ''
+
+            text = (title + ' ' + summary).strip()
             if len(text) < 20:
                 continue
 
@@ -387,7 +411,6 @@ class OilBot:
                 self.execute_trade(signal)
 
     def run(self):
-        """Main loop with error recovery."""
         self.init_binance()
         print("[START] News scanner active. Listening for oil headlines...")
         logging.info("=== BOT STARTED ===")
