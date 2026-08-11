@@ -48,7 +48,6 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
 # ==================== FuturesAccount ====================
 class FuturesAccount:
-    # ... (keep exactly the same as before) ...
     def __init__(self, initial_balance):
         self.cash = initial_balance
         self.position = 0.0
@@ -155,37 +154,66 @@ class OilBot:
         self.max_consecutive_errors = 5
 
     def init_binance(self):
-        """Connect to Binance Futures Demo."""
+        """Connect to Binance Futures Demo with full diagnostics."""
         try:
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET)
             self.client.API_URL = 'https://demo-fapi.binance.com/fapi/v1'
             self.client.WEBSOCKET_URL = 'wss://demo-fstream.binance.com/ws'
             
-            info = self.client.futures_exchange_info()
-            symbols = [s['symbol'] for s in info['symbols']]
-            if self.active_symbol not in symbols:
-                print(f"[WARN] {self.active_symbol} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
-                logging.warning(f"{self.active_symbol} not found. Trying fallback.")
-                if FALLBACK_SYMBOL not in symbols:
-                    print(f"[CRITICAL] Neither symbol found. Exiting.")
-                    logging.critical("No valid symbols found.")
-                    exit(1)
-                self.active_symbol = FALLBACK_SYMBOL
+            # ---------- DIAGNOSTIC 1: Check server time ----------
+            try:
+                server_time = self.client.get_server_time()
+                print(f"[DIAG] Server time: {server_time}", flush=True)
+            except Exception as e:
+                print(f"[CRITICAL] Cannot reach Binance Demo: {e}", flush=True)
+                logging.critical(f"Server time check failed: {e}")
+                exit(1)
+
+            # ---------- DIAGNOSTIC 2: List Futures symbols ----------
+            try:
+                info = self.client.futures_exchange_info()
+                symbols = [s['symbol'] for s in info['symbols']]
+                print(f"[DIAG] Futures exchange info OK. Symbols count: {len(symbols)}", flush=True)
+                if self.active_symbol not in symbols:
+                    print(f"[WARN] {self.active_symbol} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
+                    logging.warning(f"{self.active_symbol} not found. Trying fallback.")
+                    if FALLBACK_SYMBOL not in symbols:
+                        print(f"[CRITICAL] Neither symbol found. Exiting.")
+                        logging.critical("No valid symbols found.")
+                        exit(1)
+                    self.active_symbol = FALLBACK_SYMBOL
+            except Exception as e:
+                print(f"[CRITICAL] Cannot fetch futures exchange info: {e}", flush=True)
+                logging.critical(f"Futures exchange info failed: {e}")
+                exit(1)
+
+            # ---------- DIAGNOSTIC 3: Fetch account info (tests Futures permission) ----------
+            try:
+                account = self.client.futures_account()
+                print(f"[DIAG] Futures account access OK. Balances: {account.get('totalMarginBalance', 'unknown')}", flush=True)
+            except Exception as e:
+                print(f"[CRITICAL] Cannot access futures account: {e}", flush=True)
+                logging.critical(f"Futures account access failed: {e}")
+                print("[FIX] Ensure API key has 'Enable Futures' checked on demo.binance.com")
+                print("[FIX] Ensure IP restriction is disabled (empty) on the API key settings.")
+                exit(1)
+
+            # ---------- Set leverage ----------
+            for attempt in range(3):
+                try:
+                    self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
+                    logging.info(f"Leverage set to {LEVERAGE}x")
+                    break
+                except Exception as e:
+                    print(f"[WARN] Leverage attempt {attempt+1} failed: {e}")
+                    time.sleep(1)
+
             print(f"[INIT] Connected to Futures Demo. Using symbol: {self.active_symbol}")
             logging.info(f"Connected to Futures Demo. Symbol: {self.active_symbol}")
         except Exception as e:
             print(f"[ERROR] Cannot connect to Binance Futures Demo: {e}")
             logging.error(f"Connection failed: {e}")
             exit(1)
-
-        for attempt in range(3):
-            try:
-                self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
-                logging.info(f"Leverage set to {LEVERAGE}x")
-                break
-            except Exception as e:
-                print(f"[WARN] Leverage attempt {attempt+1} failed: {e}")
-                time.sleep(1)
 
     def fetch_price(self):
         for attempt in range(3):
