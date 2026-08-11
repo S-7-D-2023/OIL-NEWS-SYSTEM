@@ -154,11 +154,10 @@ class OilBot:
         self.max_consecutive_errors = 5
 
     def init_binance(self):
-        """Connect to Binance Futures Demo with full diagnostics."""
+        """Connect to Binance Futures Demo using testnet=True (no manual URL)."""
         try:
-            self.client = Client(BINANCE_API_KEY, BINANCE_SECRET)
-            self.client.API_URL = 'https://demo-fapi.binance.com/fapi/v1'
-            self.client.WEBSOCKET_URL = 'wss://demo-fstream.binance.com/ws'
+            # testnet=True automatically sets the correct base URLs
+            self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
             
             # ---------- DIAGNOSTIC 1: Check server time ----------
             try:
