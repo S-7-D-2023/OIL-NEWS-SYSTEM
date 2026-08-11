@@ -4,6 +4,7 @@ import json
 import re
 import random
 import logging
+import sys
 from enum import Enum
 from datetime import datetime, timedelta
 import requests
@@ -14,11 +15,14 @@ from dotenv import load_dotenv
 
 from sentiment import get_sentiment, Signal
 
+# ---- Force unbuffered output ----
+sys.stdout.reconfigure(line_buffering=True)
+
 load_dotenv()
 
 # ==================== LOGGING SETUP ====================
 logging.basicConfig(
-    filename='trading_bot.log',
+    stream=sys.stdout,
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -44,6 +48,7 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
 # ==================== FuturesAccount ====================
 class FuturesAccount:
+    # ... exactly the same as your code ... (keep unchanged)
     def __init__(self, initial_balance):
         self.cash = initial_balance
         self.position = 0.0
@@ -150,7 +155,7 @@ class OilBot:
         self.max_consecutive_errors = 5
 
     def init_binance(self):
-        """Connect to Binance Futures Testnet - FIXED."""
+        """Connect to Binance Futures Demo."""
         try:
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET)
             self.client.API_URL = 'https://demo-fapi.binance.com/fapi/v1'
@@ -340,45 +345,53 @@ class OilBot:
 
         self.last_trade_time = time.time()
 
+    def _safe_find_text(self, element, xpath_queries):
+        """Helper that fixes DeprecationWarning by checking is not None."""
+        for query in xpath_queries:
+            elem = element.find(query)
+            if elem is not None and elem.text:
+                return elem.text.strip()
+        return ""
+
     def check_news(self):
         """Fetch RSS using requests + XML parsing (no feedparser)."""
-        print(f"[RSS] Fetching {RSS_URL}")
+        print(f"[RSS] Fetching {RSS_URL}", flush=True)
+        logging.info("Fetching RSS")
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
             response = requests.get(RSS_URL, headers=headers, timeout=15)
             response.raise_for_status()
         except Exception as e:
-            print(f"[RSS ERROR] {e}")
+            print(f"[RSS ERROR] {e}", flush=True)
             logging.error(f"RSS fetch error: {e}")
             return
 
         try:
             root = ET.fromstring(response.content)
-            # RSS namespace
-            ns = {'': 'http://www.w3.org/2005/Atom'}
-            # Try to find items: Google RSS uses <entry> under <feed>
-            # But we can also search for <item> in RSS 2.0
-            # Let's handle both: find all <entry> or <item>
-            items = root.findall('.//entry') or root.findall('.//item')
+            # Find all entries (Atom) or items (RSS)
+            items = root.findall('.//{http://www.w3.org/2005/Atom}entry') or root.findall('.//item')
             if not items:
-                # Try with namespace
-                items = root.findall('.//{http://www.w3.org/2005/Atom}entry')
+                items = root.findall('.//entry')  # fallback
             if not items:
-                print("[RSS] No entries found.")
+                print("[RSS] No entries found.", flush=True)
                 return
         except Exception as e:
-            print(f"[RSS PARSE ERROR] {e}")
+            print(f"[RSS PARSE ERROR] {e}", flush=True)
             logging.error(f"RSS parse error: {e}")
             return
 
         for item in items:
-            # Extract GUID, title, summary
-            guid_elem = item.find('id') or item.find('guid') or item.find('{http://www.w3.org/2005/Atom}id')
-            guid = guid_elem.text if guid_elem is not None else None
+            # GUID extraction using safe helper
+            guid = self._safe_find_text(item, [
+                '{http://www.w3.org/2005/Atom}id',
+                'guid',
+                'id'
+            ])
             if not guid:
-                link_elem = item.find('link')
-                if link_elem is not None:
-                    guid = link_elem.get('href') or link_elem.text
+                # fallback to link
+                link = item.find('link')
+                if link is not None:
+                    guid = link.get('href') or (link.text if link.text else '')
             if not guid:
                 continue
 
@@ -386,41 +399,49 @@ class OilBot:
                 continue
             self.seen_guids.add(guid)
 
-            # Prevent memory leak
             if len(self.seen_guids) > self.max_guids:
                 self.seen_guids = set(list(self.seen_guids)[-5000:])
 
-            title_elem = item.find('title') or item.find('{http://www.w3.org/2005/Atom}title')
-            title = title_elem.text if title_elem is not None else ''
-            summary_elem = item.find('summary') or item.find('description') or item.find('content')
-            if summary_elem is not None:
-                summary = summary_elem.text if summary_elem.text else ''
-            else:
-                summary = ''
+            title = self._safe_find_text(item, [
+                '{http://www.w3.org/2005/Atom}title',
+                'title'
+            ])
+            summary = self._safe_find_text(item, [
+                '{http://www.w3.org/2005/Atom}summary',
+                'summary',
+                'description',
+                'content'
+            ])
 
-            text = (title + ' ' + summary).strip()
+            text = f"{title} {summary}".strip()
             if len(text) < 20:
                 continue
 
-            print(f"\n[NEWS] {title}")
+            print(f"\n[NEWS] {title}", flush=True)
             logging.info(f"NEWS: {title}")
             signal = get_sentiment(text, conflict_mode=CONFLICT_MODE)
-            print(f"[SENTIMENT] {signal.value}")
+            print(f"[SENTIMENT] {signal.value}", flush=True)
             logging.info(f"Sentiment: {signal.value}")
             if signal != Signal.NEUTRAL:
                 self.execute_trade(signal)
 
     def run(self):
         self.init_binance()
-        print("[START] News scanner active. Listening for oil headlines...")
+        print("[START] News scanner active. Listening for oil headlines...", flush=True)
         logging.info("=== BOT STARTED ===")
+        last_heartbeat = time.time()
         while True:
             try:
                 self.check_news()
             except Exception as e:
-                print(f"[ERROR] check_news: {e}")
+                print(f"[ERROR] check_news: {e}", flush=True)
                 logging.error(f"check_news error: {e}")
                 time.sleep(10)
+            # Heartbeat to show loop is alive
+            now = time.time()
+            if now - last_heartbeat >= 300:  # every 5 minutes
+                print("[HEARTBEAT] Loop is alive.", flush=True)
+                last_heartbeat = now
             time.sleep(POLL_INTERVAL)
 
 
@@ -439,10 +460,8 @@ def run_health_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # Start health check server
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
     
-    # Start bot
     bot = OilBot()
     bot.run()
