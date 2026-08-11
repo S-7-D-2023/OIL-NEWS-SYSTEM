@@ -48,7 +48,7 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
 # ==================== FuturesAccount ====================
 class FuturesAccount:
-    # ... exactly the same as your code ... (keep unchanged)
+    # ... (keep exactly the same as before) ...
     def __init__(self, initial_balance):
         self.cash = initial_balance
         self.position = 0.0
@@ -275,7 +275,7 @@ class OilBot:
         if now - self.last_trade_time < COOLDOWN_SECONDS:
             wait = COOLDOWN_SECONDS - (now - self.last_trade_time)
             print(f"[COOLDOWN] Wait {wait:.1f}s")
-            return
+            return {"status": "cooldown", "wait": wait}
 
         price = self.fetch_price()
         if price is None:
@@ -284,9 +284,9 @@ class OilBot:
                 print("[CRITICAL] Too many errors. Waiting 60s...")
                 time.sleep(60)
                 self.consecutive_errors = 0
-            return
-        self.consecutive_errors = 0
+            return {"status": "error", "message": "Price fetch failed"}
 
+        self.consecutive_errors = 0
         self.account.update_price(price)
 
         equity_before = self.account.total_equity
@@ -297,6 +297,7 @@ class OilBot:
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity_before:.2f}")
 
         pos = self.account.position
+        trade_result = {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity}
 
         if pos == 0:
             if signal == Signal.BULL:
@@ -310,15 +311,20 @@ class OilBot:
                 sl_price = price * (1 + SL_PERCENT)
                 tp_price = price * (1 - TP_PERCENT)
 
-            if self.place_market_order(side, quantity):
+            market_ok = self.place_market_order(side, quantity)
+            if market_ok:
                 self.place_stop_order(sl_side, quantity, sl_price)
                 self.place_tp_order(sl_side, quantity, tp_price)
                 self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
-                print(f"[POSITION] SL: ${sl_price:.2f} | TP: ${tp_price:.2f}")
-                logging.info(f"New position. SL: ${sl_price:.2f} | TP: ${tp_price:.2f}")
+                trade_result["action"] = "opened"
+                trade_result["sl"] = sl_price
+                trade_result["tp"] = tp_price
+            else:
+                trade_result["status"] = "order_failed"
         else:
             if (pos > 0 and signal == Signal.BULL) or (pos < 0 and signal == Signal.BEAR):
                 print("[HOLD] Same direction.")
+                trade_result["status"] = "hold"
             else:
                 print("[REVERSE] Opposite signal – closing and reversing.")
                 logging.info("Reversing position")
@@ -342,11 +348,16 @@ class OilBot:
                     self.place_stop_order(sl_side, quantity, sl_price)
                     self.place_tp_order(sl_side, quantity, tp_price)
                     self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
+                    trade_result["action"] = "reversed"
+                    trade_result["sl"] = sl_price
+                    trade_result["tp"] = tp_price
+                else:
+                    trade_result["status"] = "order_failed"
 
         self.last_trade_time = time.time()
+        return trade_result
 
     def _safe_find_text(self, element, xpath_queries):
-        """Helper that fixes DeprecationWarning by checking is not None."""
         for query in xpath_queries:
             elem = element.find(query)
             if elem is not None and elem.text:
@@ -354,7 +365,6 @@ class OilBot:
         return ""
 
     def check_news(self):
-        """Fetch RSS using requests + XML parsing (no feedparser)."""
         print(f"[RSS] Fetching {RSS_URL}", flush=True)
         logging.info("Fetching RSS")
         try:
@@ -368,10 +378,9 @@ class OilBot:
 
         try:
             root = ET.fromstring(response.content)
-            # Find all entries (Atom) or items (RSS)
             items = root.findall('.//{http://www.w3.org/2005/Atom}entry') or root.findall('.//item')
             if not items:
-                items = root.findall('.//entry')  # fallback
+                items = root.findall('.//entry')
             if not items:
                 print("[RSS] No entries found.", flush=True)
                 return
@@ -381,14 +390,8 @@ class OilBot:
             return
 
         for item in items:
-            # GUID extraction using safe helper
-            guid = self._safe_find_text(item, [
-                '{http://www.w3.org/2005/Atom}id',
-                'guid',
-                'id'
-            ])
+            guid = self._safe_find_text(item, ['{http://www.w3.org/2005/Atom}id', 'guid', 'id'])
             if not guid:
-                # fallback to link
                 link = item.find('link')
                 if link is not None:
                     guid = link.get('href') or (link.text if link.text else '')
@@ -402,16 +405,8 @@ class OilBot:
             if len(self.seen_guids) > self.max_guids:
                 self.seen_guids = set(list(self.seen_guids)[-5000:])
 
-            title = self._safe_find_text(item, [
-                '{http://www.w3.org/2005/Atom}title',
-                'title'
-            ])
-            summary = self._safe_find_text(item, [
-                '{http://www.w3.org/2005/Atom}summary',
-                'summary',
-                'description',
-                'content'
-            ])
+            title = self._safe_find_text(item, ['{http://www.w3.org/2005/Atom}title', 'title'])
+            summary = self._safe_find_text(item, ['{http://www.w3.org/2005/Atom}summary', 'summary', 'description', 'content'])
 
             text = f"{title} {summary}".strip()
             if len(text) < 20:
@@ -437,31 +432,91 @@ class OilBot:
                 print(f"[ERROR] check_news: {e}", flush=True)
                 logging.error(f"check_news error: {e}")
                 time.sleep(10)
-            # Heartbeat to show loop is alive
             now = time.time()
-            if now - last_heartbeat >= 300:  # every 5 minutes
+            if now - last_heartbeat >= 300:
                 print("[HEARTBEAT] Loop is alive.", flush=True)
                 last_heartbeat = now
             time.sleep(POLL_INTERVAL)
 
 
+# ==================== HEALTH + MANUAL TEST SERVER ====================
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
-class HealthHandler(BaseHTTPRequestHandler):
+# Global reference to the bot (set before starting the server)
+bot = None
+
+class RequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
+        if self.path == '/health':
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is running")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == '/test':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            try:
+                data = json.loads(post_data)
+                news = data.get('news', '')
+            except:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'Invalid JSON')
+                return
+
+            if not news:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'Missing "news" field')
+                return
+
+            # Run sentiment
+            signal = get_sentiment(news, conflict_mode=CONFLICT_MODE)
+            print(f"\n[MANUAL TEST] News: {news}")
+            print(f"[SENTIMENT] {signal.value}")
+
+            if signal == Signal.NEUTRAL:
+                result = {"status": "neutral", "signal": "NEUTRAL"}
+            else:
+                # Use the global bot instance to execute trade
+                if bot is None:
+                    result = {"status": "error", "message": "Bot not initialized yet"}
+                else:
+                    trade_result = bot.execute_trade(signal)
+                    result = {
+                        "status": "trade_attempted",
+                        "signal": signal.value,
+                        "trade_result": trade_result
+                    }
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    server = HTTPServer(('0.0.0.0', port), RequestHandler)
+    print(f"Health & test server running on port {port}")
     server.serve_forever()
 
 if __name__ == "__main__":
+    # Create the bot (but don't run its main loop in this thread)
+    bot = OilBot()
+    # We need to init binance here before starting the loop
+    bot.init_binance()
+
+    # Start the HTTP server in a daemon thread
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
-    
-    bot = OilBot()
+
+    # Now run the RSS polling loop in the main thread
     bot.run()
