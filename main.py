@@ -11,8 +11,8 @@ import requests
 import xml.etree.ElementTree as ET
 from binance.client import Client
 from binance.enums import *
+from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
-
 from sentiment import get_sentiment, Signal
 
 # ---- Force unbuffered output ----
@@ -153,12 +153,19 @@ class OilBot:
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
 
+        # Price cache to reduce API calls
+        self._price_cache = None
+        self._price_cache_time = 0
+        self._price_cache_ttl = 2  # seconds
+
     def init_binance(self):
-        """Connect to Binance Futures Demo using testnet=True (no manual URL)."""
+        """Connect to Binance Futures Demo – CORRECT URL."""
         try:
-            # testnet=True automatically sets the correct base URLs
-            self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
-            
+            # Do NOT use testnet=True – we manually set the Futures Demo URL
+            self.client = Client(BINANCE_API_KEY, BINANCE_SECRET)
+            self.client.API_URL = 'https://demo-fapi.binance.com/fapi/v1'
+            self.client.WEBSOCKET_URL = 'wss://demo-fstream.binance.com/ws'
+
             # ---------- DIAGNOSTIC 1: Check server time ----------
             try:
                 server_time = self.client.get_server_time()
@@ -174,7 +181,7 @@ class OilBot:
                 symbols = [s['symbol'] for s in info['symbols']]
                 print(f"[DIAG] Futures exchange info OK. Symbols count: {len(symbols)}", flush=True)
                 if self.active_symbol not in symbols:
-                    print(f"[WARN] {self.active_symbol} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
+                    print(f"[WARN] {self.active_symbol} not on demo. Trying fallback {FALLBACK_SYMBOL}...")
                     logging.warning(f"{self.active_symbol} not found. Trying fallback.")
                     if FALLBACK_SYMBOL not in symbols:
                         print(f"[CRITICAL] Neither symbol found. Exiting.")
@@ -189,12 +196,15 @@ class OilBot:
             # ---------- DIAGNOSTIC 3: Fetch account info (tests Futures permission) ----------
             try:
                 account = self.client.futures_account()
-                print(f"[DIAG] Futures account access OK. Balances: {account.get('totalMarginBalance', 'unknown')}", flush=True)
-            except Exception as e:
+                print(f"[DIAG] Futures account access OK. Balance: {account.get('totalWalletBalance', 'unknown')}", flush=True)
+            except BinanceAPIException as e:
                 print(f"[CRITICAL] Cannot access futures account: {e}", flush=True)
                 logging.critical(f"Futures account access failed: {e}")
                 print("[FIX] Ensure API key has 'Enable Futures' checked on demo.binance.com")
                 print("[FIX] Ensure IP restriction is disabled (empty) on the API key settings.")
+                exit(1)
+            except Exception as e:
+                print(f"[CRITICAL] Unexpected error: {e}", flush=True)
                 exit(1)
 
             # ---------- Set leverage ----------
@@ -215,21 +225,40 @@ class OilBot:
             exit(1)
 
     def fetch_price(self):
+        """Get current price with cache and exponential backoff."""
+        now = time.time()
+        # Return cached price if fresh
+        if self._price_cache is not None and (now - self._price_cache_time) < self._price_cache_ttl:
+            return self._price_cache
+
         for attempt in range(3):
             try:
                 ticker = self.client.futures_symbol_ticker(symbol=self.active_symbol)
-                return float(ticker['price'])
-            except:
-                try:
-                    mark = self.client.futures_mark_price(symbol=self.active_symbol)
-                    return float(mark['markPrice'])
-                except Exception as e:
+                price = float(ticker['price'])
+                # Update cache
+                self._price_cache = price
+                self._price_cache_time = time.time()
+                return price
+            except BinanceAPIException as e:
+                # If rate limited, wait longer
+                if e.code == -1003:  # "Way too many requests"
+                    wait = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                    print(f"[RATE LIMIT] Waiting {wait}s before retry...")
+                    time.sleep(wait)
+                else:
                     if attempt < 2:
-                        time.sleep(0.5)
+                        time.sleep(1)
                     else:
                         print(f"[ERROR] Price fetch failed: {e}")
                         logging.error(f"Price fetch failed: {e}")
                         return None
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(1)
+                else:
+                    print(f"[ERROR] Price fetch failed: {e}")
+                    logging.error(f"Price fetch failed: {e}")
+                    return None
         return None
 
     def place_market_order(self, side, quantity):
@@ -244,6 +273,18 @@ class OilBot:
                 print(f"[MARKET ORDER] {order}")
                 logging.info(f"MARKET ORDER: {order}")
                 return order
+            except BinanceAPIException as e:
+                if e.code == -1003:
+                    wait = 2 ** (attempt + 1)
+                    print(f"[RATE LIMIT] Waiting {wait}s before retry...")
+                    time.sleep(wait)
+                else:
+                    print(f"[MARKET ORDER ERROR] Attempt {attempt+1}: {e}")
+                    if attempt < 2:
+                        time.sleep(1)
+                    else:
+                        logging.error(f"Market order failed: {e}")
+                        return None
             except Exception as e:
                 print(f"[MARKET ORDER ERROR] Attempt {attempt+1}: {e}")
                 if attempt < 2:
@@ -266,6 +307,18 @@ class OilBot:
                 print(f"[STOP LOSS] {order}")
                 logging.info(f"STOP LOSS: {order}")
                 return order
+            except BinanceAPIException as e:
+                if e.code == -1003:
+                    wait = 2 ** (attempt + 1)
+                    print(f"[RATE LIMIT] Waiting {wait}s before retry...")
+                    time.sleep(wait)
+                else:
+                    print(f"[STOP ORDER ERROR] Attempt {attempt+1}: {e}")
+                    if attempt < 2:
+                        time.sleep(1)
+                    else:
+                        logging.error(f"Stop order failed: {e}")
+                        return None
             except Exception as e:
                 print(f"[STOP ORDER ERROR] Attempt {attempt+1}: {e}")
                 if attempt < 2:
@@ -288,6 +341,18 @@ class OilBot:
                 print(f"[TAKE PROFIT] {order}")
                 logging.info(f"TAKE PROFIT: {order}")
                 return order
+            except BinanceAPIException as e:
+                if e.code == -1003:
+                    wait = 2 ** (attempt + 1)
+                    print(f"[RATE LIMIT] Waiting {wait}s before retry...")
+                    time.sleep(wait)
+                else:
+                    print(f"[TP ORDER ERROR] Attempt {attempt+1}: {e}")
+                    if attempt < 2:
+                        time.sleep(1)
+                    else:
+                        logging.error(f"TP order failed: {e}")
+                        return None
             except Exception as e:
                 print(f"[TP ORDER ERROR] Attempt {attempt+1}: {e}")
                 if attempt < 2:
