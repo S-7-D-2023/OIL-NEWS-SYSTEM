@@ -158,6 +158,12 @@ class OilBot:
         self._price_cache_time = 0
         self._price_cache_ttl = 2  # seconds
 
+        # For manual SL/TP monitoring (fallback)
+        self.sl_price = None
+        self.tp_price = None
+        self.monitor_thread = None
+        self.stop_monitoring = False
+
     def init_binance(self):
         """Connect to Binance Futures Demo using testnet=True."""
         try:
@@ -286,6 +292,10 @@ class OilBot:
         return None
 
     def place_stop_order(self, side, quantity, stop_price):
+        """
+        Place a STOP MARKET order with Algo Order API support.
+        Uses correct parameters to avoid -4120 error.
+        """
         for attempt in range(3):
             try:
                 order = self.client.futures_create_order(
@@ -293,7 +303,12 @@ class OilBot:
                     side=side,
                     type=FUTURE_ORDER_TYPE_STOP_MARKET,
                     quantity=round(quantity, 3),
-                    stopPrice=round(stop_price, 2)
+                    stopPrice=round(stop_price, 2),
+                    timeInForce='GTC',
+                    reduceOnly=True,          # critical: closes position
+                    workingType='MARK_PRICE', # use mark price for trigger
+                    newOrderRespType='RESULT',
+                    priceMatch='NONE',
                 )
                 print(f"[STOP LOSS] {order}")
                 logging.info(f"STOP LOSS: {order}")
@@ -320,6 +335,9 @@ class OilBot:
         return None
 
     def place_tp_order(self, side, quantity, tp_price):
+        """
+        Place a TAKE PROFIT MARKET order with Algo Order API support.
+        """
         for attempt in range(3):
             try:
                 order = self.client.futures_create_order(
@@ -327,7 +345,12 @@ class OilBot:
                     side=side,
                     type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
                     quantity=round(quantity, 3),
-                    stopPrice=round(tp_price, 2)
+                    stopPrice=round(tp_price, 2),
+                    timeInForce='GTC',
+                    reduceOnly=True,          # critical: closes position
+                    workingType='MARK_PRICE',
+                    newOrderRespType='RESULT',
+                    priceMatch='NONE',
                 )
                 print(f"[TAKE PROFIT] {order}")
                 logging.info(f"TAKE PROFIT: {order}")
@@ -352,6 +375,47 @@ class OilBot:
                     logging.error(f"TP order failed: {e}")
                     return None
         return None
+
+    def monitor_position(self):
+        """
+        Fallback: manually monitor price and close position when SL/TP hit.
+        Runs in a background thread.
+        """
+        print("[MONITOR] Starting position monitor thread.")
+        while not self.stop_monitoring:
+            if self.account.position == 0:
+                break
+            current_price = self.fetch_price()
+            if current_price is None:
+                time.sleep(1)
+                continue
+            self.account.update_price(current_price)
+
+            if self.account.position > 0:  # Long position
+                if current_price <= self.sl_price:
+                    print(f"[SL HIT] Long position closed at ${current_price:.2f}")
+                    self.place_market_order(SIDE_SELL, abs(self.account.position))
+                    self.account.close_position(current_price)
+                    break
+                elif current_price >= self.tp_price:
+                    print(f"[TP HIT] Long position closed at ${current_price:.2f}")
+                    self.place_market_order(SIDE_SELL, abs(self.account.position))
+                    self.account.close_position(current_price)
+                    break
+            elif self.account.position < 0:  # Short position
+                if current_price >= self.sl_price:
+                    print(f"[SL HIT] Short position closed at ${current_price:.2f}")
+                    self.place_market_order(SIDE_BUY, abs(self.account.position))
+                    self.account.close_position(current_price)
+                    break
+                elif current_price <= self.tp_price:
+                    print(f"[TP HIT] Short position closed at ${current_price:.2f}")
+                    self.place_market_order(SIDE_BUY, abs(self.account.position))
+                    self.account.close_position(current_price)
+                    break
+
+            time.sleep(1)  # check every second
+        print("[MONITOR] Monitor thread ended.")
 
     def execute_trade(self, signal):
         now = time.time()
@@ -396,8 +460,23 @@ class OilBot:
 
             market_ok = self.place_market_order(side, quantity)
             if market_ok:
-                self.place_stop_order(sl_side, quantity, sl_price)
-                self.place_tp_order(sl_side, quantity, tp_price)
+                # Store SL/TP for fallback monitor
+                self.sl_price = sl_price
+                self.tp_price = tp_price
+
+                # Try placing Algo orders
+                sl_ok = self.place_stop_order(sl_side, quantity, sl_price)
+                tp_ok = self.place_tp_order(sl_side, quantity, tp_price)
+
+                # If either fails, start manual monitor
+                if not sl_ok or not tp_ok:
+                    print("[WARN] Algo SL/TP failed, starting manual monitor.")
+                    self.stop_monitoring = False
+                    import threading
+                    if self.monitor_thread is None or not self.monitor_thread.is_alive():
+                        self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
+                        self.monitor_thread.start()
+
                 self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
                 trade_result["action"] = "opened"
                 trade_result["sl"] = sl_price
@@ -405,17 +484,24 @@ class OilBot:
             else:
                 trade_result["status"] = "order_failed"
         else:
+            # Existing position logic (unchanged)
             if (pos > 0 and signal == Signal.BULL) or (pos < 0 and signal == Signal.BEAR):
                 print("[HOLD] Same direction.")
                 trade_result["status"] = "hold"
             else:
                 print("[REVERSE] Opposite signal – closing and reversing.")
                 logging.info("Reversing position")
+                # Stop monitoring if active
+                self.stop_monitoring = True
+                if self.monitor_thread and self.monitor_thread.is_alive():
+                    self.monitor_thread.join(timeout=2)
+
                 close_side = SIDE_SELL if pos > 0 else SIDE_BUY
                 close_qty = abs(pos)
                 self.place_market_order(close_side, close_qty)
                 self.account.close_position(price)
 
+                # Re-open in new direction
                 if signal == Signal.BULL:
                     side = SIDE_BUY
                     sl_side = SIDE_SELL
@@ -428,8 +514,16 @@ class OilBot:
                     tp_price = price * (1 - TP_PERCENT)
 
                 if self.place_market_order(side, quantity):
-                    self.place_stop_order(sl_side, quantity, sl_price)
-                    self.place_tp_order(sl_side, quantity, tp_price)
+                    self.sl_price = sl_price
+                    self.tp_price = tp_price
+                    sl_ok = self.place_stop_order(sl_side, quantity, sl_price)
+                    tp_ok = self.place_tp_order(sl_side, quantity, tp_price)
+                    if not sl_ok or not tp_ok:
+                        print("[WARN] Algo SL/TP failed, starting manual monitor.")
+                        self.stop_monitoring = False
+                        if self.monitor_thread is None or not self.monitor_thread.is_alive():
+                            self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
+                            self.monitor_thread.start()
                     self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
                     trade_result["action"] = "reversed"
                     trade_result["sl"] = sl_price
