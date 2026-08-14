@@ -158,7 +158,7 @@ class OilBot:
         self._price_cache_time = 0
         self._price_cache_ttl = 2  # seconds
 
-        # For manual SL/TP monitoring (fallback)
+        # For fallback monitor
         self.sl_price = None
         self.tp_price = None
         self.monitor_thread = None
@@ -167,12 +167,9 @@ class OilBot:
     def init_binance(self):
         """Connect to Binance Futures Demo using testnet=True."""
         try:
-            # testnet=True + manual URL override (library bug workaround)
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
-            # Force correct URL (known issue with python-binance)
             self.client.API_URL = 'https://testnet.binance.vision/api'
 
-            # ---------- DIAGNOSTIC 1: Check Futures exchange info ----------
             try:
                 info = self.client.futures_exchange_info()
                 symbols = [s['symbol'] for s in info['symbols']]
@@ -190,7 +187,6 @@ class OilBot:
                 logging.critical(f"Futures exchange info failed: {e}")
                 exit(1)
 
-            # ---------- DIAGNOSTIC 2: Fetch account info ----------
             try:
                 account = self.client.futures_account()
                 print(f"[DIAG] Futures account access OK. Balance: {account.get('totalWalletBalance', 'unknown')}", flush=True)
@@ -204,7 +200,6 @@ class OilBot:
                 print(f"[CRITICAL] Unexpected error: {e}", flush=True)
                 exit(1)
 
-            # ---------- Set leverage ----------
             for attempt in range(3):
                 try:
                     self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
@@ -224,7 +219,6 @@ class OilBot:
     def fetch_price(self):
         """Get current price with cache and exponential backoff."""
         now = time.time()
-        # Return cached price if fresh
         if self._price_cache is not None and (now - self._price_cache_time) < self._price_cache_ttl:
             return self._price_cache
 
@@ -232,14 +226,12 @@ class OilBot:
             try:
                 ticker = self.client.futures_symbol_ticker(symbol=self.active_symbol)
                 price = float(ticker['price'])
-                # Update cache
                 self._price_cache = price
                 self._price_cache_time = time.time()
                 return price
             except BinanceAPIException as e:
-                # If rate limited, wait longer
-                if e.code == -1003:  # "Way too many requests"
-                    wait = 2 ** (attempt + 1)  # 2, 4, 8 seconds
+                if e.code == -1003:
+                    wait = 2 ** (attempt + 1)
                     print(f"[RATE LIMIT] Waiting {wait}s before retry...")
                     time.sleep(wait)
                 else:
@@ -293,22 +285,21 @@ class OilBot:
 
     def place_stop_order(self, side, quantity, stop_price):
         """
-        Place a STOP MARKET order with Algo Order API support.
-        Uses correct parameters to avoid -4120 error.
+        Place a STOP MARKET order using the Algo Order API.
+        Required for Binance Futures after Dec 2025.
         """
         for attempt in range(3):
             try:
-                order = self.client.futures_create_order(
+                order = self.client.futures_create_algo_order(
                     symbol=self.active_symbol,
                     side=side,
                     type=FUTURE_ORDER_TYPE_STOP_MARKET,
                     quantity=round(quantity, 3),
-                    stopPrice=round(stop_price, 2),
-                    timeInForce='GTC',
-                    reduceOnly=True,          # critical: closes position
-                    workingType='MARK_PRICE', # use mark price for trigger
-                    newOrderRespType='RESULT',
-                    priceMatch='NONE',
+                    triggerPrice=round(stop_price, 2),
+                    workingType='MARK_PRICE',
+                    reduceOnly=True,
+                    algoType='CONDITIONAL',
+                    priceProtect=True,
                 )
                 print(f"[STOP LOSS] {order}")
                 logging.info(f"STOP LOSS: {order}")
@@ -336,21 +327,21 @@ class OilBot:
 
     def place_tp_order(self, side, quantity, tp_price):
         """
-        Place a TAKE PROFIT MARKET order with Algo Order API support.
+        Place a TAKE PROFIT MARKET order using the Algo Order API.
+        Required for Binance Futures after Dec 2025.
         """
         for attempt in range(3):
             try:
-                order = self.client.futures_create_order(
+                order = self.client.futures_create_algo_order(
                     symbol=self.active_symbol,
                     side=side,
                     type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
                     quantity=round(quantity, 3),
-                    stopPrice=round(tp_price, 2),
-                    timeInForce='GTC',
-                    reduceOnly=True,          # critical: closes position
+                    triggerPrice=round(tp_price, 2),
                     workingType='MARK_PRICE',
-                    newOrderRespType='RESULT',
-                    priceMatch='NONE',
+                    reduceOnly=True,
+                    algoType='CONDITIONAL',
+                    priceProtect=True,
                 )
                 print(f"[TAKE PROFIT] {order}")
                 logging.info(f"TAKE PROFIT: {order}")
@@ -377,10 +368,7 @@ class OilBot:
         return None
 
     def monitor_position(self):
-        """
-        Fallback: manually monitor price and close position when SL/TP hit.
-        Runs in a background thread.
-        """
+        """Fallback: monitor price manually and close when SL/TP hit."""
         print("[MONITOR] Starting position monitor thread.")
         while not self.stop_monitoring:
             if self.account.position == 0:
@@ -391,30 +379,29 @@ class OilBot:
                 continue
             self.account.update_price(current_price)
 
-            if self.account.position > 0:  # Long position
+            if self.account.position > 0:  # Long
                 if current_price <= self.sl_price:
-                    print(f"[SL HIT] Long position closed at ${current_price:.2f}")
+                    print(f"[SL HIT] Long closed at ${current_price:.2f}")
                     self.place_market_order(SIDE_SELL, abs(self.account.position))
                     self.account.close_position(current_price)
                     break
                 elif current_price >= self.tp_price:
-                    print(f"[TP HIT] Long position closed at ${current_price:.2f}")
+                    print(f"[TP HIT] Long closed at ${current_price:.2f}")
                     self.place_market_order(SIDE_SELL, abs(self.account.position))
                     self.account.close_position(current_price)
                     break
-            elif self.account.position < 0:  # Short position
+            elif self.account.position < 0:  # Short
                 if current_price >= self.sl_price:
-                    print(f"[SL HIT] Short position closed at ${current_price:.2f}")
+                    print(f"[SL HIT] Short closed at ${current_price:.2f}")
                     self.place_market_order(SIDE_BUY, abs(self.account.position))
                     self.account.close_position(current_price)
                     break
                 elif current_price <= self.tp_price:
-                    print(f"[TP HIT] Short position closed at ${current_price:.2f}")
+                    print(f"[TP HIT] Short closed at ${current_price:.2f}")
                     self.place_market_order(SIDE_BUY, abs(self.account.position))
                     self.account.close_position(current_price)
                     break
-
-            time.sleep(1)  # check every second
+            time.sleep(1)
         print("[MONITOR] Monitor thread ended.")
 
     def execute_trade(self, signal):
@@ -460,23 +447,16 @@ class OilBot:
 
             market_ok = self.place_market_order(side, quantity)
             if market_ok:
-                # Store SL/TP for fallback monitor
                 self.sl_price = sl_price
                 self.tp_price = tp_price
-
-                # Try placing Algo orders
                 sl_ok = self.place_stop_order(sl_side, quantity, sl_price)
                 tp_ok = self.place_tp_order(sl_side, quantity, tp_price)
-
-                # If either fails, start manual monitor
                 if not sl_ok or not tp_ok:
                     print("[WARN] Algo SL/TP failed, starting manual monitor.")
                     self.stop_monitoring = False
-                    import threading
                     if self.monitor_thread is None or not self.monitor_thread.is_alive():
                         self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
                         self.monitor_thread.start()
-
                 self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
                 trade_result["action"] = "opened"
                 trade_result["sl"] = sl_price
@@ -484,14 +464,12 @@ class OilBot:
             else:
                 trade_result["status"] = "order_failed"
         else:
-            # Existing position logic (unchanged)
             if (pos > 0 and signal == Signal.BULL) or (pos < 0 and signal == Signal.BEAR):
                 print("[HOLD] Same direction.")
                 trade_result["status"] = "hold"
             else:
                 print("[REVERSE] Opposite signal – closing and reversing.")
                 logging.info("Reversing position")
-                # Stop monitoring if active
                 self.stop_monitoring = True
                 if self.monitor_thread and self.monitor_thread.is_alive():
                     self.monitor_thread.join(timeout=2)
@@ -501,7 +479,6 @@ class OilBot:
                 self.place_market_order(close_side, close_qty)
                 self.account.close_position(price)
 
-                # Re-open in new direction
                 if signal == Signal.BULL:
                     side = SIDE_BUY
                     sl_side = SIDE_SELL
@@ -620,7 +597,6 @@ class OilBot:
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
-# Global reference to the bot (set before starting the server)
 bot = None
 
 class RequestHandler(BaseHTTPRequestHandler):
@@ -652,7 +628,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b'Missing "news" field')
                 return
 
-            # Run sentiment
             signal = get_sentiment(news, conflict_mode=CONFLICT_MODE)
             print(f"\n[MANUAL TEST] News: {news}")
             print(f"[SENTIMENT] {signal.value}")
@@ -660,7 +635,6 @@ class RequestHandler(BaseHTTPRequestHandler):
             if signal == Signal.NEUTRAL:
                 result = {"status": "neutral", "signal": "NEUTRAL"}
             else:
-                # Use the global bot instance to execute trade
                 if bot is None:
                     result = {"status": "error", "message": "Bot not initialized yet"}
                 else:
@@ -686,14 +660,10 @@ def run_health_server():
     server.serve_forever()
 
 if __name__ == "__main__":
-    # Create the bot (but don't run its main loop in this thread)
     bot = OilBot()
-    # We need to init binance here before starting the loop
     bot.init_binance()
 
-    # Start the HTTP server in a daemon thread
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
-    # Now run the RSS polling loop in the main thread
     bot.run()
