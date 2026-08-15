@@ -31,9 +31,13 @@ logging.basicConfig(
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-MARGIN_PERCENT = float(os.getenv("MARGIN_PERCENT", "0.5"))
-SL_PERCENT = float(os.getenv("SL_PERCENT", "0.01"))
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.01"))
+MARGIN_PERCENT = float(os.getenv("MARGIN_PERCENT", "0.5"))  # kept but unused for risk-based sizing
+
+# Risk and target percentages
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.10"))     # 10% of equity risked per trade
+SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
+
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))
 MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "5.0"))
@@ -281,7 +285,7 @@ class OilBot:
         return None
 
     def place_stop_order(self, side, quantity, stop_price):
-        """Place STOP MARKET using Algo Order API - FIXED LOGGING."""
+        """Place STOP MARKET using Algo Order API."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
@@ -320,7 +324,7 @@ class OilBot:
         return None
 
     def place_tp_order(self, side, quantity, tp_price):
-        """Place TAKE PROFIT MARKET using Algo Order API - FIXED LOGGING."""
+        """Place TAKE PROFIT MARKET using Algo Order API."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
@@ -414,12 +418,20 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        equity_before = self.account.total_equity
-        margin_to_use = equity_before * MARGIN_PERCENT
-        position_value = margin_to_use * LEVERAGE
-        quantity = position_value / price
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity_before:.2f} | Size: {quantity:.4f}")
-        logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity_before:.2f}")
+        # === NEW RISK-BASED POSITION SIZING ===
+        equity = self.account.total_equity
+        # Calculate position size based on risk
+        risk_amount = equity * RISK_PERCENT          # dollars to risk
+        sl_distance = price * SL_PERCENT             # dollar distance for SL
+        quantity = risk_amount / sl_distance         # quantity that gives that risk
+        # Ensure minimum notional
+        if quantity * price < MIN_NOTIONAL:
+            quantity = MIN_NOTIONAL / price
+        # Cap by available margin: quantity * price / leverage <= free margin + current margin
+        # Actually we check in open_position later
+
+        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f} | Size: {quantity:.4f}")
+        logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f}")
 
         pos = self.account.position
         trade_result = {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity}
