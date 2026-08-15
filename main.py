@@ -43,9 +43,6 @@ MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "5.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
-# RSS is REMOVED – no automatic news
-# We will only use manual /test endpoint
-
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
@@ -151,7 +148,9 @@ class OilBot:
         self.account = FuturesAccount(INITIAL_CAPITAL)
         self.last_trade_time = 0
         self.active_symbol = SYMBOL
-        self.seen_guids = set()  # not used but kept
+        self.seen_guids = set()  # kept for compatibility
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 5
 
         self._price_cache = None
         self._price_cache_time = 0
@@ -163,7 +162,7 @@ class OilBot:
         self.stop_monitoring = False
 
     def init_binance(self):
-        """Connect to Binance Futures Demo using testnet=True."""
+        """Connect to Binance Futures Demo."""
         try:
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
@@ -281,7 +280,6 @@ class OilBot:
         return None
 
     def place_stop_order(self, side, quantity, stop_price):
-        """Place STOP MARKET using Algo Order API."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
@@ -320,7 +318,6 @@ class OilBot:
         return None
 
     def place_tp_order(self, side, quantity, tp_price):
-        """Place TAKE PROFIT MARKET using Algo Order API."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
@@ -359,7 +356,6 @@ class OilBot:
         return None
 
     def monitor_position(self):
-        """Fallback: monitor price manually and close when SL/TP hit."""
         print("[MONITOR] Starting position monitor thread.")
         while not self.stop_monitoring:
             if self.account.position == 0:
@@ -370,7 +366,7 @@ class OilBot:
                 continue
             self.account.update_price(current_price)
 
-            if self.account.position > 0:  # Long
+            if self.account.position > 0:
                 if current_price <= self.sl_price:
                     print(f"[SL HIT] Long closed at ${current_price:.2f}")
                     self.place_market_order(SIDE_SELL, abs(self.account.position))
@@ -381,7 +377,7 @@ class OilBot:
                     self.place_market_order(SIDE_SELL, abs(self.account.position))
                     self.account.close_position(current_price)
                     break
-            elif self.account.position < 0:  # Short
+            elif self.account.position < 0:
                 if current_price >= self.sl_price:
                     print(f"[SL HIT] Short closed at ${current_price:.2f}")
                     self.place_market_order(SIDE_BUY, abs(self.account.position))
@@ -395,7 +391,6 @@ class OilBot:
             time.sleep(1)
         print("[MONITOR] Monitor thread ended.")
 
-    # ==================== FIXED execute_trade WITH MARGIN CHECK ====================
     def execute_trade(self, signal):
         now = time.time()
         if now - self.last_trade_time < COOLDOWN_SECONDS:
@@ -426,29 +421,34 @@ class OilBot:
         position_value = quantity * price
         margin_required = position_value / LEVERAGE
 
-        # If not enough margin, reduce quantity to fit available free margin
+        # Get current free margin
         free_margin = self.account.free_margin
+
+        # Debug: print values
+        print(f"[MARGIN DEBUG] price: {price:.2f}, quantity: {quantity:.6f}, position_value: {position_value:.2f}, margin_required: {margin_required:.2f}, free_margin: {free_margin:.2f}", flush=True)
+
+        # If not enough margin, reduce quantity to fit available free margin
         if margin_required > free_margin:
-            # Reduce quantity to fit available margin
-            max_margin_use = free_margin * 0.95  # Use 95% of free margin
+            # Reduce quantity to fit available margin (use 95% to leave buffer)
+            max_margin_use = free_margin * 0.95
             max_position_value = max_margin_use * LEVERAGE
             max_quantity = max_position_value / price
-            print(f"[MARGIN] Required: ${margin_required:.2f} | Free: ${free_margin:.2f} | Reducing size from {quantity:.4f} to {max_quantity:.4f}")
-            logging.warning(f"Margin insufficient. Reduced quantity from {quantity:.4f} to {max_quantity:.4f}")
+            print(f"[MARGIN] Required: ${margin_required:.2f} | Free: ${free_margin:.2f} | Reducing size from {quantity:.6f} to {max_quantity:.6f}", flush=True)
+            logging.warning(f"Margin insufficient. Reduced quantity from {quantity:.6f} to {max_quantity:.6f}")
             quantity = max_quantity
             # Recalculate risk (will be lower than RISK_PERCENT)
             actual_risk = (quantity * price * SL_PERCENT) / equity
-            print(f"[MARGIN] Actual risk: {actual_risk:.2%} (target was {RISK_PERCENT:.2%})")
+            print(f"[MARGIN] Actual risk: {actual_risk:.2%} (target was {RISK_PERCENT:.2%})", flush=True)
 
         # Ensure minimum notional
         if quantity * price < MIN_NOTIONAL:
             quantity = MIN_NOTIONAL / price
-            print(f"[MARGIN] Adjusted to minimum notional: {quantity:.4f}")
+            print(f"[MARGIN] Adjusted to minimum notional: {quantity:.6f}", flush=True)
 
-        # Round to 3 decimal places
+        # Round to 3 decimal places for exchange
         quantity = round(quantity, 3)
 
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f} | Size: {quantity:.4f}")
+        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f} | Size: {quantity:.4f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f}")
 
         pos = self.account.position
@@ -466,7 +466,7 @@ class OilBot:
                 sl_price = price * (1 + SL_PERCENT)
                 tp_price = price * (1 - TP_PERCENT)
 
-            # === NOW PLACE THE ORDER ===
+            # Place market order
             market_ok = self.place_market_order(side, quantity)
             if market_ok:
                 self.sl_price = sl_price
@@ -479,7 +479,7 @@ class OilBot:
                     if self.monitor_thread is None or not self.monitor_thread.is_alive():
                         self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
                         self.monitor_thread.start()
-                # This should now succeed because we checked margin
+                # Open position in internal accounting – now should succeed
                 self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
                 trade_result["action"] = "opened"
                 trade_result["sl"] = sl_price
@@ -487,6 +487,7 @@ class OilBot:
             else:
                 trade_result["status"] = "order_failed"
         else:
+            # Handle existing position – reverse if opposite signal
             if (pos > 0 and signal == Signal.BULL) or (pos < 0 and signal == Signal.BEAR):
                 print("[HOLD] Same direction.")
                 trade_result["status"] = "hold"
@@ -534,14 +535,13 @@ class OilBot:
         self.last_trade_time = time.time()
         return trade_result
 
-    # The run() method is now IDLE – only health check and manual tests
+    # Removed RSS check_news() – only manual tests
     def run(self):
         self.init_binance()
         print("[START] Bot is ready. Waiting for manual news via /test endpoint.", flush=True)
         logging.info("=== BOT STARTED (MANUAL MODE) ===")
-        # Keep the bot alive by sleeping forever (or until interrupted)
         while True:
-            time.sleep(60)  # just keep the process running
+            time.sleep(60)  # Keep process alive
 
 
 # ==================== HEALTH + MANUAL TEST SERVER ====================
