@@ -416,27 +416,26 @@ class OilBot:
         sl_distance = price * SL_PERCENT
         quantity = risk_amount / sl_distance
 
-        # === MARGIN CHECK - CRITICAL FIX ===
-        # Calculate margin required for this trade
+        # === MARGIN CHECK WITH SAFETY BUFFER ===
         position_value = quantity * price
         margin_required = position_value / LEVERAGE
 
-        # Get current free margin
         free_margin = self.account.free_margin
 
-        # Debug: print values
-        print(f"[MARGIN DEBUG] price: {price:.2f}, quantity: {quantity:.6f}, position_value: {position_value:.2f}, margin_required: {margin_required:.2f}, free_margin: {free_margin:.2f}", flush=True)
+        # Add a buffer of 0.5% of free margin to avoid rounding errors
+        margin_buffer = free_margin * 0.005  # 0.5% buffer
+        required_with_buffer = margin_required + margin_buffer
 
-        # If not enough margin, reduce quantity to fit available free margin
-        if margin_required > free_margin:
-            # Reduce quantity to fit available margin (use 95% to leave buffer)
+        print(f"[MARGIN DEBUG] price: {price:.2f}, quantity: {quantity:.6f}, position_value: {position_value:.2f}, margin_required: {margin_required:.2f}, free_margin: {free_margin:.2f}, buffer: {margin_buffer:.2f}", flush=True)
+
+        if required_with_buffer > free_margin:
+            # Reduce quantity to fit within margin (use 95% of free margin)
             max_margin_use = free_margin * 0.95
             max_position_value = max_margin_use * LEVERAGE
             max_quantity = max_position_value / price
-            print(f"[MARGIN] Required: ${margin_required:.2f} | Free: ${free_margin:.2f} | Reducing size from {quantity:.6f} to {max_quantity:.6f}", flush=True)
+            print(f"[MARGIN] Required with buffer: ${required_with_buffer:.2f} | Free: ${free_margin:.2f} | Reducing size from {quantity:.6f} to {max_quantity:.6f}", flush=True)
             logging.warning(f"Margin insufficient. Reduced quantity from {quantity:.6f} to {max_quantity:.6f}")
             quantity = max_quantity
-            # Recalculate risk (will be lower than RISK_PERCENT)
             actual_risk = (quantity * price * SL_PERCENT) / equity
             print(f"[MARGIN] Actual risk: {actual_risk:.2%} (target was {RISK_PERCENT:.2%})", flush=True)
 
@@ -466,7 +465,6 @@ class OilBot:
                 sl_price = price * (1 + SL_PERCENT)
                 tp_price = price * (1 - TP_PERCENT)
 
-            # Place market order
             market_ok = self.place_market_order(side, quantity)
             if market_ok:
                 self.sl_price = sl_price
@@ -479,7 +477,6 @@ class OilBot:
                     if self.monitor_thread is None or not self.monitor_thread.is_alive():
                         self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
                         self.monitor_thread.start()
-                # Open position in internal accounting – now should succeed
                 self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
                 trade_result["action"] = "opened"
                 trade_result["sl"] = sl_price
@@ -487,7 +484,6 @@ class OilBot:
             else:
                 trade_result["status"] = "order_failed"
         else:
-            # Handle existing position – reverse if opposite signal
             if (pos > 0 and signal == Signal.BULL) or (pos < 0 and signal == Signal.BEAR):
                 print("[HOLD] Same direction.")
                 trade_result["status"] = "hold"
