@@ -399,6 +399,7 @@ class OilBot:
             time.sleep(1)
         print("[MONITOR] Monitor thread ended.")
 
+    # ==================== FIXED execute_trade WITH MARGIN CHECK ====================
     def execute_trade(self, signal):
         now = time.time()
         if now - self.last_trade_time < COOLDOWN_SECONDS:
@@ -418,17 +419,38 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === NEW RISK-BASED POSITION SIZING ===
+        # === RISK-BASED POSITION SIZING ===
         equity = self.account.total_equity
-        # Calculate position size based on risk
-        risk_amount = equity * RISK_PERCENT          # dollars to risk
-        sl_distance = price * SL_PERCENT             # dollar distance for SL
-        quantity = risk_amount / sl_distance         # quantity that gives that risk
+        risk_amount = equity * RISK_PERCENT
+        sl_distance = price * SL_PERCENT
+        quantity = risk_amount / sl_distance
+
+        # === MARGIN CHECK - CRITICAL FIX ===
+        # Calculate margin required for this trade
+        position_value = quantity * price
+        margin_required = position_value / LEVERAGE
+
+        # If not enough margin, reduce quantity to fit available free margin
+        free_margin = self.account.free_margin
+        if margin_required > free_margin:
+            # Reduce quantity to fit available margin
+            max_margin_use = free_margin * 0.95  # Use 95% of free margin
+            max_position_value = max_margin_use * LEVERAGE
+            max_quantity = max_position_value / price
+            print(f"[MARGIN] Required: ${margin_required:.2f} | Free: ${free_margin:.2f} | Reducing size from {quantity:.4f} to {max_quantity:.4f}")
+            logging.warning(f"Margin insufficient. Reduced quantity from {quantity:.4f} to {max_quantity:.4f}")
+            quantity = max_quantity
+            # Recalculate risk (will be lower than RISK_PERCENT)
+            actual_risk = (quantity * price * SL_PERCENT) / equity
+            print(f"[MARGIN] Actual risk: {actual_risk:.2%} (target was {RISK_PERCENT:.2%})")
+
         # Ensure minimum notional
         if quantity * price < MIN_NOTIONAL:
             quantity = MIN_NOTIONAL / price
-        # Cap by available margin: quantity * price / leverage <= free margin + current margin
-        # Actually we check in open_position later
+            print(f"[MARGIN] Adjusted to minimum notional: {quantity:.4f}")
+
+        # Round to 3 decimal places
+        quantity = round(quantity, 3)
 
         print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f} | Size: {quantity:.4f}")
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f}")
