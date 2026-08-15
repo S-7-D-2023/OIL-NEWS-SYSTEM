@@ -32,8 +32,10 @@ SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-# Risk and target percentages
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.10"))     # 10% of equity risked per trade
+# Position sizing: use 10% of account equity as position value (notional)
+POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.10"))  # 10% of equity as position size
+
+# SL and TP percentages (distance from entry)
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
 
@@ -148,7 +150,7 @@ class OilBot:
         self.account = FuturesAccount(INITIAL_CAPITAL)
         self.last_trade_time = 0
         self.active_symbol = SYMBOL
-        self.seen_guids = set()  # kept for compatibility
+        self.seen_guids = set()
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
 
@@ -162,7 +164,6 @@ class OilBot:
         self.stop_monitoring = False
 
     def init_binance(self):
-        """Connect to Binance Futures Demo."""
         try:
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
@@ -410,48 +411,45 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === RISK-BASED POSITION SIZING ===
+        # === POSITION SIZING: USE % OF EQUITY AS POSITION VALUE ===
         equity = self.account.total_equity
-        risk_amount = equity * RISK_PERCENT
-        sl_distance = price * SL_PERCENT
-        quantity = risk_amount / sl_distance
+        position_value = equity * POSITION_PERCENT   # e.g., 10% of equity
+        quantity = position_value / price
 
-        # === MARGIN CHECK WITH SAFETY BUFFER ===
-        position_value = quantity * price
-        margin_required = position_value / LEVERAGE
-
+        # === MARGIN CHECK WITH BUFFER ===
+        margin_required = position_value / LEVERAGE   # margin needed for this position
         free_margin = self.account.free_margin
 
-        # Add a buffer of 0.5% of free margin to avoid rounding errors
-        margin_buffer = free_margin * 0.005  # 0.5% buffer
+        # Add 0.5% buffer to avoid rounding errors
+        margin_buffer = free_margin * 0.005
         required_with_buffer = margin_required + margin_buffer
 
-        print(f"[MARGIN DEBUG] price: {price:.2f}, quantity: {quantity:.6f}, position_value: {position_value:.2f}, margin_required: {margin_required:.2f}, free_margin: {free_margin:.2f}, buffer: {margin_buffer:.2f}", flush=True)
+        print(f"[MARGIN DEBUG] price: {price:.2f}, position_value: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, buffer: ${margin_buffer:.2f}", flush=True)
 
         if required_with_buffer > free_margin:
-            # Reduce quantity to fit within margin (use 95% of free margin)
+            # Reduce position value to fit within margin (use 95% of free margin)
             max_margin_use = free_margin * 0.95
             max_position_value = max_margin_use * LEVERAGE
             max_quantity = max_position_value / price
-            print(f"[MARGIN] Required with buffer: ${required_with_buffer:.2f} | Free: ${free_margin:.2f} | Reducing size from {quantity:.6f} to {max_quantity:.6f}", flush=True)
-            logging.warning(f"Margin insufficient. Reduced quantity from {quantity:.6f} to {max_quantity:.6f}")
+            print(f"[MARGIN] Required with buffer: ${required_with_buffer:.2f} | Free: ${free_margin:.2f} | Reducing position from ${position_value:.2f} to ${max_position_value:.2f}", flush=True)
+            logging.warning(f"Margin insufficient. Reduced position from ${position_value:.2f} to ${max_position_value:.2f}")
             quantity = max_quantity
-            actual_risk = (quantity * price * SL_PERCENT) / equity
-            print(f"[MARGIN] Actual risk: {actual_risk:.2%} (target was {RISK_PERCENT:.2%})", flush=True)
+            position_value = max_position_value
 
         # Ensure minimum notional
         if quantity * price < MIN_NOTIONAL:
             quantity = MIN_NOTIONAL / price
-            print(f"[MARGIN] Adjusted to minimum notional: {quantity:.6f}", flush=True)
+            position_value = quantity * price
+            print(f"[MARGIN] Adjusted to minimum notional: ${position_value:.2f}", flush=True)
 
         # Round to 3 decimal places for exchange
         quantity = round(quantity, 3)
 
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f} | Size: {quantity:.4f}", flush=True)
-        logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Risk: ${risk_amount:.2f}")
+        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} ({POSITION_PERCENT*100:.0f}%) | Size: {quantity:.4f}", flush=True)
+        logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
 
         pos = self.account.position
-        trade_result = {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity}
+        trade_result = {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity, "position_value": position_value}
 
         if pos == 0:
             if signal == Signal.BULL:
@@ -531,7 +529,7 @@ class OilBot:
         self.last_trade_time = time.time()
         return trade_result
 
-    # Removed RSS check_news() – only manual tests
+    # Removed RSS – only manual tests
     def run(self):
         self.init_binance()
         print("[START] Bot is ready. Waiting for manual news via /test endpoint.", flush=True)
