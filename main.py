@@ -153,12 +153,10 @@ class OilBot:
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
 
-        # Price cache to reduce API calls
         self._price_cache = None
         self._price_cache_time = 0
-        self._price_cache_ttl = 2  # seconds
+        self._price_cache_ttl = 2
 
-        # For fallback monitor
         self.sl_price = None
         self.tp_price = None
         self.monitor_thread = None
@@ -217,7 +215,6 @@ class OilBot:
             exit(1)
 
     def fetch_price(self):
-        """Get current price with cache and exponential backoff."""
         now = time.time()
         if self._price_cache is not None and (now - self._price_cache_time) < self._price_cache_ttl:
             return self._price_cache
@@ -284,10 +281,7 @@ class OilBot:
         return None
 
     def place_stop_order(self, side, quantity, stop_price):
-        """
-        Place a STOP MARKET order using the Algo Order API.
-        Required for Binance Futures after Dec 2025.
-        """
+        """Place STOP MARKET using Algo Order API - FIXED LOGGING."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
@@ -301,8 +295,8 @@ class OilBot:
                     algoType='CONDITIONAL',
                     priceProtect=True,
                 )
-                print(f"[STOP LOSS] {order}")
-                logging.info(f"STOP LOSS: {order}")
+                print(f"[STOP LOSS] ✅ ORDER PLACED - AlgoId: {order.get('algoId', 'N/A')} | Trigger: ${stop_price:.2f}")
+                logging.info(f"STOP LOSS PLACED: {order}")
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
@@ -326,10 +320,7 @@ class OilBot:
         return None
 
     def place_tp_order(self, side, quantity, tp_price):
-        """
-        Place a TAKE PROFIT MARKET order using the Algo Order API.
-        Required for Binance Futures after Dec 2025.
-        """
+        """Place TAKE PROFIT MARKET using Algo Order API - FIXED LOGGING."""
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
@@ -343,8 +334,8 @@ class OilBot:
                     algoType='CONDITIONAL',
                     priceProtect=True,
                 )
-                print(f"[TAKE PROFIT] {order}")
-                logging.info(f"TAKE PROFIT: {order}")
+                print(f"[TAKE PROFIT] ✅ ORDER PLACED - AlgoId: {order.get('algoId', 'N/A')} | Trigger: ${tp_price:.2f}")
+                logging.info(f"TAKE PROFIT PLACED: {order}")
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
