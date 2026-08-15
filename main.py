@@ -31,7 +31,6 @@ logging.basicConfig(
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
-MARGIN_PERCENT = float(os.getenv("MARGIN_PERCENT", "0.5"))  # kept but unused for risk-based sizing
 
 # Risk and target percentages
 RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.10"))     # 10% of equity risked per trade
@@ -44,8 +43,8 @@ MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "5.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
-RSS_URL = os.getenv("RSS_URL", "https://news.google.com/rss/search?q=crude+oil+OPEC+WTI+Brent&hl=en-US&gl=US&ceid=US:en")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+# RSS is REMOVED – no automatic news
+# We will only use manual /test endpoint
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
@@ -152,10 +151,7 @@ class OilBot:
         self.account = FuturesAccount(INITIAL_CAPITAL)
         self.last_trade_time = 0
         self.active_symbol = SYMBOL
-        self.seen_guids = set()
-        self.max_guids = 10000
-        self.consecutive_errors = 0
-        self.max_consecutive_errors = 5
+        self.seen_guids = set()  # not used but kept
 
         self._price_cache = None
         self._price_cache_time = 0
@@ -470,6 +466,7 @@ class OilBot:
                 sl_price = price * (1 + SL_PERCENT)
                 tp_price = price * (1 - TP_PERCENT)
 
+            # === NOW PLACE THE ORDER ===
             market_ok = self.place_market_order(side, quantity)
             if market_ok:
                 self.sl_price = sl_price
@@ -482,6 +479,7 @@ class OilBot:
                     if self.monitor_thread is None or not self.monitor_thread.is_alive():
                         self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
                         self.monitor_thread.start()
+                # This should now succeed because we checked margin
                 self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
                 trade_result["action"] = "opened"
                 trade_result["sl"] = sl_price
@@ -536,86 +534,14 @@ class OilBot:
         self.last_trade_time = time.time()
         return trade_result
 
-    def _safe_find_text(self, element, xpath_queries):
-        for query in xpath_queries:
-            elem = element.find(query)
-            if elem is not None and elem.text:
-                return elem.text.strip()
-        return ""
-
-    def check_news(self):
-        print(f"[RSS] Fetching {RSS_URL}", flush=True)
-        logging.info("Fetching RSS")
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            response = requests.get(RSS_URL, headers=headers, timeout=15)
-            response.raise_for_status()
-        except Exception as e:
-            print(f"[RSS ERROR] {e}", flush=True)
-            logging.error(f"RSS fetch error: {e}")
-            return
-
-        try:
-            root = ET.fromstring(response.content)
-            items = root.findall('.//{http://www.w3.org/2005/Atom}entry') or root.findall('.//item')
-            if not items:
-                items = root.findall('.//entry')
-            if not items:
-                print("[RSS] No entries found.", flush=True)
-                return
-        except Exception as e:
-            print(f"[RSS PARSE ERROR] {e}", flush=True)
-            logging.error(f"RSS parse error: {e}")
-            return
-
-        for item in items:
-            guid = self._safe_find_text(item, ['{http://www.w3.org/2005/Atom}id', 'guid', 'id'])
-            if not guid:
-                link = item.find('link')
-                if link is not None:
-                    guid = link.get('href') or (link.text if link.text else '')
-            if not guid:
-                continue
-
-            if guid in self.seen_guids:
-                continue
-            self.seen_guids.add(guid)
-
-            if len(self.seen_guids) > self.max_guids:
-                self.seen_guids = set(list(self.seen_guids)[-5000:])
-
-            title = self._safe_find_text(item, ['{http://www.w3.org/2005/Atom}title', 'title'])
-            summary = self._safe_find_text(item, ['{http://www.w3.org/2005/Atom}summary', 'summary', 'description', 'content'])
-
-            text = f"{title} {summary}".strip()
-            if len(text) < 20:
-                continue
-
-            print(f"\n[NEWS] {title}", flush=True)
-            logging.info(f"NEWS: {title}")
-            signal = get_sentiment(text, conflict_mode=CONFLICT_MODE)
-            print(f"[SENTIMENT] {signal.value}", flush=True)
-            logging.info(f"Sentiment: {signal.value}")
-            if signal != Signal.NEUTRAL:
-                self.execute_trade(signal)
-
+    # The run() method is now IDLE – only health check and manual tests
     def run(self):
         self.init_binance()
-        print("[START] News scanner active. Listening for oil headlines...", flush=True)
-        logging.info("=== BOT STARTED ===")
-        last_heartbeat = time.time()
+        print("[START] Bot is ready. Waiting for manual news via /test endpoint.", flush=True)
+        logging.info("=== BOT STARTED (MANUAL MODE) ===")
+        # Keep the bot alive by sleeping forever (or until interrupted)
         while True:
-            try:
-                self.check_news()
-            except Exception as e:
-                print(f"[ERROR] check_news: {e}", flush=True)
-                logging.error(f"check_news error: {e}")
-                time.sleep(10)
-            now = time.time()
-            if now - last_heartbeat >= 300:
-                print("[HEARTBEAT] Loop is alive.", flush=True)
-                last_heartbeat = now
-            time.sleep(POLL_INTERVAL)
+            time.sleep(60)  # just keep the process running
 
 
 # ==================== HEALTH + MANUAL TEST SERVER ====================
