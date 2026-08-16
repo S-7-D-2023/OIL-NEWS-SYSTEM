@@ -436,36 +436,28 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === POSITION SIZING: USE % OF EQUITY AS POSITION VALUE ===
+        # === EXACT 10% OF EQUITY AS POSITION VALUE ===
         equity = self.account.total_equity
         desired_position_value = equity * POSITION_PERCENT   # e.g., 10% of equity
 
-        # Calculate initial quantity
+        # Calculate quantity from desired position value
         quantity = desired_position_value / price
-
-        # === ENFORCE MINIMUM QUANTITY (LOT SIZE) ===
-        if self.min_qty is not None and quantity < self.min_qty:
-            quantity = self.min_qty
-            # Recalculate position value
-            position_value = quantity * price
-            print(f"[SIZE] Adjusted to minimum quantity {self.min_qty} -> position ${position_value:.2f}", flush=True)
-        else:
-            position_value = desired_position_value
 
         # === ROUND TO STEP SIZE ===
         if self.step_size:
             quantity = round(quantity / self.step_size) * self.step_size
         quantity = round(quantity, 8)
 
-        # === ENFORCE MINIMUM NOTIONAL ===
+        # Recalculate position value after rounding
+        position_value = quantity * price
+
+        # === CHECK MINIMUM REQUIREMENTS ===
+        if self.min_qty is not None and quantity < self.min_qty:
+            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade at 10% of equity.", flush=True)
+            return {"status": "error", "message": "Quantity below minimum"}
         if self.min_notional is not None and position_value < self.min_notional:
-            # Increase position to min notional if possible (check margin later)
-            quantity = self.min_notional / price
-            if self.step_size:
-                quantity = round(quantity / self.step_size) * self.step_size
-            quantity = round(quantity, 8)
-            position_value = quantity * price
-            print(f"[SIZE] Adjusted to minimum notional ${self.min_notional:.2f} -> position ${position_value:.2f}", flush=True)
+            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional}. Cannot trade at 10% of equity.", flush=True)
+            return {"status": "error", "message": "Position below minimum notional"}
 
         # === MARGIN CHECK WITH BUFFER ===
         margin_required = position_value / LEVERAGE
@@ -476,7 +468,7 @@ class OilBot:
         print(f"[MARGIN DEBUG] price: {price:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, buffer: ${margin_buffer:.2f}", flush=True)
 
         if required_with_buffer > free_margin:
-            # Reduce position to fit within margin
+            # Reduce position to fit margin (but try to keep as close to desired as possible)
             max_margin_use = free_margin * 0.95
             max_position_value = max_margin_use * LEVERAGE
             max_quantity = max_position_value / price
@@ -484,15 +476,16 @@ class OilBot:
                 max_quantity = round(max_quantity / self.step_size) * self.step_size
             max_quantity = round(max_quantity, 8)
             max_position_value = max_quantity * price
+
+            # Check if reduced position still meets min_notional
+            if max_position_value < self.min_notional or max_quantity < self.min_qty:
+                print(f"[ERROR] Margin insufficient and reduced position would be below minimum. Cannot trade.", flush=True)
+                return {"status": "error", "message": "Margin insufficient"}
+            
             print(f"[MARGIN] Required with buffer: ${required_with_buffer:.2f} | Free: ${free_margin:.2f} | Reducing position from ${position_value:.2f} to ${max_position_value:.2f}", flush=True)
             logging.warning(f"Margin insufficient. Reduced position from ${position_value:.2f} to ${max_position_value:.2f}")
             quantity = max_quantity
             position_value = max_position_value
-
-        # Final check: if still below min notional, we cannot trade
-        if position_value < self.min_notional:
-            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade.", flush=True)
-            return {"status": "error", "message": "Position too small"}
 
         print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} ({POSITION_PERCENT*100:.0f}% of equity) | Size: {quantity:.8f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
