@@ -33,14 +33,14 @@ FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
 # Position sizing: use 100% of account equity as position value (notional) – ENTIRE ACCOUNT
-POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% of equity – changed from 0.10
+POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% of equity
 
 # SL and TP percentages (distance from entry)
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
 
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback if balance fetch fails
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
@@ -57,6 +57,7 @@ class FuturesAccount:
         self.realized_pnl = 0.0
         self.leverage = LEVERAGE
         self.current_price = 0.0
+        self.initial_balance = initial_balance
 
     @property
     def total_equity(self):
@@ -76,6 +77,12 @@ class FuturesAccount:
 
     def can_open(self, margin_required):
         return self.free_margin >= margin_required
+
+    def set_balance(self, real_balance):
+        """Update cash to real balance from exchange."""
+        self.cash = real_balance
+        self.initial_balance = real_balance
+        # margin_used will be updated separately
 
     def open_position(self, side, amount, price):
         position_value = amount * price
@@ -141,6 +148,7 @@ class FuturesAccount:
 class OilBot:
     def __init__(self):
         self.client = None
+        # temporary balance; will be updated after fetching real balance
         self.account = FuturesAccount(INITIAL_CAPITAL)
         self.last_trade_time = 0
         self.active_symbol = SYMBOL
@@ -192,7 +200,7 @@ class OilBot:
                     break
 
             if self.min_qty is None:
-                self.min_qty = 0.001   # fallback for BTCUSDT
+                self.min_qty = 0.001
                 self.step_size = 0.001
                 self.min_notional = 5.0
 
@@ -201,7 +209,13 @@ class OilBot:
             # Fetch account info
             try:
                 account = self.client.futures_account()
-                print(f"[DIAG] Futures account access OK. Balance: {account.get('totalWalletBalance', 'unknown')}", flush=True)
+                # Get total wallet balance (cross wallet)
+                total_balance = float(account.get('totalWalletBalance', 0))
+                print(f"[DIAG] Futures account access OK. Total Wallet Balance: ${total_balance:.2f}", flush=True)
+                # Update internal account with real balance
+                self.account.set_balance(total_balance)
+                print(f"[INFO] Account balance updated to ${total_balance:.2f}", flush=True)
+                logging.info(f"Real balance set to ${total_balance:.2f}")
             except BinanceAPIException as e:
                 print(f"[CRITICAL] Cannot access futures account: {e}", flush=True)
                 logging.critical(f"Futures account access failed: {e}")
