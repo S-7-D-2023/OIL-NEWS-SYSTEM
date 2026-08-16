@@ -44,9 +44,6 @@ INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
-# If True, when desired position < min notional, force to min notional (allows trading on small accounts)
-FORCE_MIN_NOTIONAL = os.getenv("FORCE_MIN_NOTIONAL", "true").lower() == "true"
-
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
@@ -454,25 +451,15 @@ class OilBot:
         # Recalculate position value after rounding
         position_value = quantity * price
 
-        # === HANDLE MINIMUM NOTIONAL ===
+        # === CHECK MINIMUM NOTIONAL (REAL EXCHANGE REQUIREMENT) ===
         if self.min_notional is not None and position_value < self.min_notional:
-            if FORCE_MIN_NOTIONAL:
-                # Force position to minimum notional
-                quantity = self.min_notional / price
-                if self.step_size:
-                    quantity = round(quantity / self.step_size) * self.step_size
-                quantity = round(quantity, 8)
-                position_value = quantity * price
-                print(f"⚠️ [SIZE] Desired position ${desired_position_value:.2f} below min notional ${self.min_notional:.2f}. Forced to min notional -> position ${position_value:.2f}", flush=True)
-                logging.warning(f"Forced to min notional: ${position_value:.2f}")
-            else:
-                print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional}. Cannot trade.", flush=True)
-                return {"status": "error", "message": "Position below minimum notional"}
+            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade at {POSITION_PERCENT*100:.0f}% of equity.", flush=True)
+            return {"status": "error", "message": f"Position ${position_value:.2f} below min notional ${self.min_notional:.2f}"}
 
         # === CHECK MINIMUM QUANTITY ===
         if self.min_qty is not None and quantity < self.min_qty:
-            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade.", flush=True)
-            return {"status": "error", "message": "Quantity below minimum"}
+            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade at {POSITION_PERCENT*100:.0f}% of equity.", flush=True)
+            return {"status": "error", "message": f"Quantity {quantity:.8f} below min {self.min_qty}"}
 
         # === MARGIN CHECK WITH BUFFER ===
         margin_required = position_value / LEVERAGE
@@ -483,7 +470,7 @@ class OilBot:
         print(f"[MARGIN DEBUG] price: {price:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, buffer: ${margin_buffer:.2f}", flush=True)
 
         if required_with_buffer > free_margin:
-            # Reduce position to fit margin
+            # Reduce position to fit margin (but keep as close to desired as possible)
             max_margin_use = free_margin * 0.95
             max_position_value = max_margin_use * LEVERAGE
             max_quantity = max_position_value / price
@@ -492,11 +479,11 @@ class OilBot:
             max_quantity = round(max_quantity, 8)
             max_position_value = max_quantity * price
 
-            # Check if reduced position still meets min_notional and min_qty
+            # Check if reduced position still meets min requirements
             if max_position_value < self.min_notional or max_quantity < self.min_qty:
                 print(f"[ERROR] Margin insufficient and reduced position would be below minimum. Cannot trade.", flush=True)
                 return {"status": "error", "message": "Margin insufficient"}
-            
+
             print(f"[MARGIN] Required with buffer: ${required_with_buffer:.2f} | Free: ${free_margin:.2f} | Reducing position from ${position_value:.2f} to ${max_position_value:.2f}", flush=True)
             logging.warning(f"Margin insufficient. Reduced position from ${position_value:.2f} to ${max_position_value:.2f}")
             quantity = max_quantity
