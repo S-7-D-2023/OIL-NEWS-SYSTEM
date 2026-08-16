@@ -20,19 +20,12 @@ sys.stdout.reconfigure(line_buffering=True)
 
 load_dotenv()
 
-# ==================== LOGGING SETUP ====================
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-
 # ==================== CONFIG ====================
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+LEVERAGE = int(os.getenv("LEVERAGE", "1"))   # DEFAULT 1 – use full account as margin
 
-# Position sizing: use 100% of account equity as position value (notional) – ENTIRE ACCOUNT
+# Position sizing: use 100% of account equity as position value (notional)
 POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% of equity
 
 # SL and TP percentages (distance from entry)
@@ -40,12 +33,19 @@ SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss dista
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
 
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback if balance fetch fails
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
+
+# ==================== LOGGING SETUP ====================
+logging.basicConfig(
+    stream=sys.stdout,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # ==================== FuturesAccount ====================
 class FuturesAccount:
@@ -79,10 +79,8 @@ class FuturesAccount:
         return self.free_margin >= margin_required
 
     def set_balance(self, real_balance):
-        """Update cash to real balance from exchange."""
         self.cash = real_balance
         self.initial_balance = real_balance
-        # margin_used will be updated separately
 
     def open_position(self, side, amount, price):
         position_value = amount * price
@@ -148,7 +146,6 @@ class FuturesAccount:
 class OilBot:
     def __init__(self):
         self.client = None
-        # temporary balance; will be updated after fetching real balance
         self.account = FuturesAccount(INITIAL_CAPITAL)
         self.last_trade_time = 0
         self.active_symbol = SYMBOL
@@ -165,7 +162,6 @@ class OilBot:
         self.monitor_thread = None
         self.stop_monitoring = False
 
-        # Symbol filters (to be populated)
         self.min_qty = None
         self.step_size = None
         self.min_notional = None
@@ -175,7 +171,6 @@ class OilBot:
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
 
-            # Fetch exchange info and symbol filters
             info = self.client.futures_exchange_info()
             symbols = [s['symbol'] for s in info['symbols']]
             print(f"[DIAG] Futures exchange info OK. Symbols: {len(symbols)}", flush=True)
@@ -188,7 +183,6 @@ class OilBot:
                     exit(1)
                 self.active_symbol = FALLBACK_SYMBOL
 
-            # Get filters for the symbol
             for s in info['symbols']:
                 if s['symbol'] == self.active_symbol:
                     for f in s['filters']:
@@ -206,27 +200,13 @@ class OilBot:
 
             print(f"[DIAG] Symbol filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
 
-            # Fetch account info
-            try:
-                account = self.client.futures_account()
-                # Get total wallet balance (cross wallet)
-                total_balance = float(account.get('totalWalletBalance', 0))
-                print(f"[DIAG] Futures account access OK. Total Wallet Balance: ${total_balance:.2f}", flush=True)
-                # Update internal account with real balance
-                self.account.set_balance(total_balance)
-                print(f"[INFO] Account balance updated to ${total_balance:.2f}", flush=True)
-                logging.info(f"Real balance set to ${total_balance:.2f}")
-            except BinanceAPIException as e:
-                print(f"[CRITICAL] Cannot access futures account: {e}", flush=True)
-                logging.critical(f"Futures account access failed: {e}")
-                print("[FIX] Ensure API key has 'Enable Futures' checked on demo.binance.com")
-                print("[FIX] Ensure IP restriction is disabled (empty) on the API key settings.")
-                exit(1)
-            except Exception as e:
-                print(f"[CRITICAL] Unexpected error: {e}", flush=True)
-                exit(1)
+            account = self.client.futures_account()
+            total_balance = float(account.get('totalWalletBalance', 0))
+            print(f"[DIAG] Futures account access OK. Total Wallet Balance: ${total_balance:.2f}", flush=True)
+            self.account.set_balance(total_balance)
+            print(f"[INFO] Account balance updated to ${total_balance:.2f}", flush=True)
+            logging.info(f"Real balance set to ${total_balance:.2f}")
 
-            # Set leverage
             for attempt in range(3):
                 try:
                     self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
@@ -277,10 +257,9 @@ class OilBot:
         return None
 
     def place_market_order(self, side, quantity):
-        # Round quantity to step size
         if self.step_size:
             quantity = round(quantity / self.step_size) * self.step_size
-        quantity = round(quantity, 8)  # keep precision
+        quantity = round(quantity, 8)
         for attempt in range(3):
             try:
                 order = self.client.futures_create_order(
@@ -450,32 +429,24 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === 100% OF EQUITY AS POSITION VALUE (ENTIRE ACCOUNT) ===
+        # === 100% OF EQUITY AS POSITION VALUE ===
         equity = self.account.total_equity
-        desired_position_value = equity * POSITION_PERCENT   # 1.0 = 100% of equity
-
-        # Calculate quantity from desired position value
+        desired_position_value = equity * POSITION_PERCENT   # 1.0 = 100%
         quantity = desired_position_value / price
 
-        # === ROUND TO STEP SIZE ===
         if self.step_size:
             quantity = round(quantity / self.step_size) * self.step_size
         quantity = round(quantity, 8)
-
-        # Recalculate position value after rounding
         position_value = quantity * price
 
-        # === CHECK MINIMUM NOTIONAL (REAL EXCHANGE REQUIREMENT) ===
         if self.min_notional is not None and position_value < self.min_notional:
             print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade with full account.", flush=True)
             return {"status": "error", "message": f"Position ${position_value:.2f} below min notional ${self.min_notional:.2f}"}
 
-        # === CHECK MINIMUM QUANTITY ===
         if self.min_qty is not None and quantity < self.min_qty:
             print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade with full account.", flush=True)
             return {"status": "error", "message": f"Quantity {quantity:.8f} below min {self.min_qty}"}
 
-        # === MARGIN CHECK WITH BUFFER ===
         margin_required = position_value / LEVERAGE
         free_margin = self.account.free_margin
         margin_buffer = free_margin * 0.005
@@ -484,7 +455,6 @@ class OilBot:
         print(f"[MARGIN DEBUG] price: {price:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, buffer: ${margin_buffer:.2f}", flush=True)
 
         if required_with_buffer > free_margin:
-            # Reduce position to fit margin (but keep as close to desired as possible)
             max_margin_use = free_margin * 0.95
             max_position_value = max_margin_use * LEVERAGE
             max_quantity = max_position_value / price
@@ -493,7 +463,6 @@ class OilBot:
             max_quantity = round(max_quantity, 8)
             max_position_value = max_quantity * price
 
-            # Check if reduced position still meets min requirements
             if max_position_value < self.min_notional or max_quantity < self.min_qty:
                 print(f"[ERROR] Margin insufficient and reduced position would be below minimum. Cannot trade with full account.", flush=True)
                 return {"status": "error", "message": "Margin insufficient"}
@@ -587,13 +556,12 @@ class OilBot:
         self.last_trade_time = time.time()
         return trade_result
 
-    # Removed RSS – only manual tests
     def run(self):
         self.init_binance()
         print("[START] Bot is ready. Waiting for manual news via /test endpoint.", flush=True)
         logging.info("=== BOT STARTED (MANUAL MODE) ===")
         while True:
-            time.sleep(60)  # Keep process alive
+            time.sleep(60)
 
 
 # ==================== HEALTH + MANUAL TEST SERVER ====================
