@@ -32,8 +32,8 @@ SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-# Position sizing: use 10% of account equity as position value (notional)
-POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.10"))  # 10% of equity as position size
+# Position sizing: use 100% of account equity as position value (notional) – ENTIRE ACCOUNT
+POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% of equity – changed from 0.10
 
 # SL and TP percentages (distance from entry)
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
@@ -436,9 +436,9 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === EXACT 10% OF EQUITY AS POSITION VALUE ===
+        # === 100% OF EQUITY AS POSITION VALUE (ENTIRE ACCOUNT) ===
         equity = self.account.total_equity
-        desired_position_value = equity * POSITION_PERCENT   # e.g., 10% of equity
+        desired_position_value = equity * POSITION_PERCENT   # 1.0 = 100% of equity
 
         # Calculate quantity from desired position value
         quantity = desired_position_value / price
@@ -453,12 +453,12 @@ class OilBot:
 
         # === CHECK MINIMUM NOTIONAL (REAL EXCHANGE REQUIREMENT) ===
         if self.min_notional is not None and position_value < self.min_notional:
-            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade at {POSITION_PERCENT*100:.0f}% of equity.", flush=True)
+            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade with full account.", flush=True)
             return {"status": "error", "message": f"Position ${position_value:.2f} below min notional ${self.min_notional:.2f}"}
 
         # === CHECK MINIMUM QUANTITY ===
         if self.min_qty is not None and quantity < self.min_qty:
-            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade at {POSITION_PERCENT*100:.0f}% of equity.", flush=True)
+            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade with full account.", flush=True)
             return {"status": "error", "message": f"Quantity {quantity:.8f} below min {self.min_qty}"}
 
         # === MARGIN CHECK WITH BUFFER ===
@@ -481,7 +481,7 @@ class OilBot:
 
             # Check if reduced position still meets min requirements
             if max_position_value < self.min_notional or max_quantity < self.min_qty:
-                print(f"[ERROR] Margin insufficient and reduced position would be below minimum. Cannot trade.", flush=True)
+                print(f"[ERROR] Margin insufficient and reduced position would be below minimum. Cannot trade with full account.", flush=True)
                 return {"status": "error", "message": "Margin insufficient"}
 
             print(f"[MARGIN] Required with buffer: ${required_with_buffer:.2f} | Free: ${free_margin:.2f} | Reducing position from ${position_value:.2f} to ${max_position_value:.2f}", flush=True)
