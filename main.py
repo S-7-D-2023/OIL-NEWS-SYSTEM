@@ -41,7 +41,6 @@ TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit dis
 
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))
-MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "5.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
@@ -80,11 +79,6 @@ class FuturesAccount:
 
     def open_position(self, side, amount, price):
         position_value = amount * price
-        if position_value < MIN_NOTIONAL:
-            msg = f"Position value ${position_value:.2f} below min notional. Rejected."
-            print(f"[ERROR] {msg}")
-            logging.error(msg)
-            return None
         margin_req = position_value / self.leverage
         if not self.can_open(margin_req):
             msg = "Not enough free margin."
@@ -163,28 +157,48 @@ class OilBot:
         self.monitor_thread = None
         self.stop_monitoring = False
 
+        # Symbol filters (to be populated)
+        self.min_qty = None
+        self.step_size = None
+        self.min_notional = None
+
     def init_binance(self):
         try:
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
             self.client.API_URL = 'https://testnet.binance.vision/api'
 
-            try:
-                info = self.client.futures_exchange_info()
-                symbols = [s['symbol'] for s in info['symbols']]
-                print(f"[DIAG] Futures exchange info OK. Symbols: {len(symbols)}", flush=True)
-                if self.active_symbol not in symbols:
-                    print(f"[WARN] {self.active_symbol} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
-                    logging.warning(f"{self.active_symbol} not found. Trying fallback.")
-                    if FALLBACK_SYMBOL not in symbols:
-                        print(f"[CRITICAL] Neither symbol found. Exiting.")
-                        logging.critical("No valid symbols found.")
-                        exit(1)
-                    self.active_symbol = FALLBACK_SYMBOL
-            except Exception as e:
-                print(f"[CRITICAL] Cannot fetch futures exchange info: {e}", flush=True)
-                logging.critical(f"Futures exchange info failed: {e}")
-                exit(1)
+            # Fetch exchange info and symbol filters
+            info = self.client.futures_exchange_info()
+            symbols = [s['symbol'] for s in info['symbols']]
+            print(f"[DIAG] Futures exchange info OK. Symbols: {len(symbols)}", flush=True)
+            if self.active_symbol not in symbols:
+                print(f"[WARN] {self.active_symbol} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
+                logging.warning(f"{self.active_symbol} not found. Trying fallback.")
+                if FALLBACK_SYMBOL not in symbols:
+                    print(f"[CRITICAL] Neither symbol found. Exiting.")
+                    logging.critical("No valid symbols found.")
+                    exit(1)
+                self.active_symbol = FALLBACK_SYMBOL
 
+            # Get filters for the symbol
+            for s in info['symbols']:
+                if s['symbol'] == self.active_symbol:
+                    for f in s['filters']:
+                        if f['filterType'] == 'LOT_SIZE':
+                            self.step_size = float(f['stepSize'])
+                            self.min_qty = float(f['minQty'])
+                        elif f['filterType'] == 'MIN_NOTIONAL':
+                            self.min_notional = float(f['notional'])
+                    break
+
+            if self.min_qty is None:
+                self.min_qty = 0.001   # fallback for BTCUSDT
+                self.step_size = 0.001
+                self.min_notional = 5.0
+
+            print(f"[DIAG] Symbol filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
+
+            # Fetch account info
             try:
                 account = self.client.futures_account()
                 print(f"[DIAG] Futures account access OK. Balance: {account.get('totalWalletBalance', 'unknown')}", flush=True)
@@ -198,6 +212,7 @@ class OilBot:
                 print(f"[CRITICAL] Unexpected error: {e}", flush=True)
                 exit(1)
 
+            # Set leverage
             for attempt in range(3):
                 try:
                     self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
@@ -248,13 +263,17 @@ class OilBot:
         return None
 
     def place_market_order(self, side, quantity):
+        # Round quantity to step size
+        if self.step_size:
+            quantity = round(quantity / self.step_size) * self.step_size
+        quantity = round(quantity, 8)  # keep precision
         for attempt in range(3):
             try:
                 order = self.client.futures_create_order(
                     symbol=self.active_symbol,
                     side=side,
                     type=FUTURE_ORDER_TYPE_MARKET,
-                    quantity=round(quantity, 3)
+                    quantity=quantity
                 )
                 print(f"[MARKET ORDER] {order}")
                 logging.info(f"MARKET ORDER: {order}")
@@ -281,13 +300,16 @@ class OilBot:
         return None
 
     def place_stop_order(self, side, quantity, stop_price):
+        if self.step_size:
+            quantity = round(quantity / self.step_size) * self.step_size
+        quantity = round(quantity, 8)
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
                     symbol=self.active_symbol,
                     side=side,
                     type=FUTURE_ORDER_TYPE_STOP_MARKET,
-                    quantity=round(quantity, 3),
+                    quantity=quantity,
                     triggerPrice=round(stop_price, 2),
                     workingType='MARK_PRICE',
                     reduceOnly=True,
@@ -319,13 +341,16 @@ class OilBot:
         return None
 
     def place_tp_order(self, side, quantity, tp_price):
+        if self.step_size:
+            quantity = round(quantity / self.step_size) * self.step_size
+        quantity = round(quantity, 8)
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
                     symbol=self.active_symbol,
                     side=side,
                     type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
-                    quantity=round(quantity, 3),
+                    quantity=quantity,
                     triggerPrice=round(tp_price, 2),
                     workingType='MARK_PRICE',
                     reduceOnly=True,
@@ -413,39 +438,63 @@ class OilBot:
 
         # === POSITION SIZING: USE % OF EQUITY AS POSITION VALUE ===
         equity = self.account.total_equity
-        position_value = equity * POSITION_PERCENT   # e.g., 10% of equity
-        quantity = position_value / price
+        desired_position_value = equity * POSITION_PERCENT   # e.g., 10% of equity
+
+        # Calculate initial quantity
+        quantity = desired_position_value / price
+
+        # === ENFORCE MINIMUM QUANTITY (LOT SIZE) ===
+        if self.min_qty is not None and quantity < self.min_qty:
+            quantity = self.min_qty
+            # Recalculate position value
+            position_value = quantity * price
+            print(f"[SIZE] Adjusted to minimum quantity {self.min_qty} -> position ${position_value:.2f}", flush=True)
+        else:
+            position_value = desired_position_value
+
+        # === ROUND TO STEP SIZE ===
+        if self.step_size:
+            quantity = round(quantity / self.step_size) * self.step_size
+        quantity = round(quantity, 8)
+
+        # === ENFORCE MINIMUM NOTIONAL ===
+        if self.min_notional is not None and position_value < self.min_notional:
+            # Increase position to min notional if possible (check margin later)
+            quantity = self.min_notional / price
+            if self.step_size:
+                quantity = round(quantity / self.step_size) * self.step_size
+            quantity = round(quantity, 8)
+            position_value = quantity * price
+            print(f"[SIZE] Adjusted to minimum notional ${self.min_notional:.2f} -> position ${position_value:.2f}", flush=True)
 
         # === MARGIN CHECK WITH BUFFER ===
-        margin_required = position_value / LEVERAGE   # margin needed for this position
+        margin_required = position_value / LEVERAGE
         free_margin = self.account.free_margin
-
-        # Add 0.5% buffer to avoid rounding errors
         margin_buffer = free_margin * 0.005
         required_with_buffer = margin_required + margin_buffer
 
-        print(f"[MARGIN DEBUG] price: {price:.2f}, position_value: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, buffer: ${margin_buffer:.2f}", flush=True)
+        print(f"[MARGIN DEBUG] price: {price:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, buffer: ${margin_buffer:.2f}", flush=True)
 
         if required_with_buffer > free_margin:
-            # Reduce position value to fit within margin (use 95% of free margin)
+            # Reduce position to fit within margin
             max_margin_use = free_margin * 0.95
             max_position_value = max_margin_use * LEVERAGE
             max_quantity = max_position_value / price
+            if self.step_size:
+                max_quantity = round(max_quantity / self.step_size) * self.step_size
+            max_quantity = round(max_quantity, 8)
+            max_position_value = max_quantity * price
             print(f"[MARGIN] Required with buffer: ${required_with_buffer:.2f} | Free: ${free_margin:.2f} | Reducing position from ${position_value:.2f} to ${max_position_value:.2f}", flush=True)
             logging.warning(f"Margin insufficient. Reduced position from ${position_value:.2f} to ${max_position_value:.2f}")
             quantity = max_quantity
             position_value = max_position_value
 
-        # Ensure minimum notional
-        if quantity * price < MIN_NOTIONAL:
-            quantity = MIN_NOTIONAL / price
-            position_value = quantity * price
-            print(f"[MARGIN] Adjusted to minimum notional: ${position_value:.2f}", flush=True)
+        # Final check: if still below min notional, we cannot trade
+        if position_value < self.min_notional:
+            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade.", flush=True)
+            return {"status": "error", "message": "Position too small"}
 
-        # Round to 3 decimal places for exchange
-        quantity = round(quantity, 3)
-
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} ({POSITION_PERCENT*100:.0f}%) | Size: {quantity:.4f}", flush=True)
+        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} ({POSITION_PERCENT*100:.0f}% of equity) | Size: {quantity:.8f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
 
         pos = self.account.position
