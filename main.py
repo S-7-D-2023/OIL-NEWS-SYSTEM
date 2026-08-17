@@ -23,17 +23,17 @@ load_dotenv()
 # ==================== CONFIG ====================
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))   # 默认 10x 杠杆
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-# 仓位大小: 使用账户权益的 100% 并应用杠杆
-POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% 的权益
+# Position sizing: use 100% of account equity and apply leverage
+POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% of equity
 
-# SL 和 TP 百分比 (距离入场价)
-SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% 止损距离
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% 止盈距离
+# SL and TP percentages (distance from entry)
+SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
 
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # 备用
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
@@ -207,6 +207,7 @@ class OilBot:
             print(f"[INFO] Account balance updated to ${total_balance:.2f}", flush=True)
             logging.info(f"Real balance set to ${total_balance:.2f}")
 
+            # ---- Set leverage ----
             for attempt in range(3):
                 try:
                     self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
@@ -214,6 +215,16 @@ class OilBot:
                     break
                 except Exception as e:
                     print(f"[WARN] Leverage attempt {attempt+1} failed: {e}")
+                    time.sleep(1)
+
+            # ---- NEW: Set margin type to ISOLATED ----
+            for attempt in range(3):
+                try:
+                    self.client.futures_change_margin_type(symbol=self.active_symbol, marginType='ISOLATED')
+                    logging.info(f"Margin type set to ISOLATED for {self.active_symbol}")
+                    break
+                except Exception as e:
+                    print(f"[WARN] Margin type attempt {attempt+1} failed: {e}")
                     time.sleep(1)
 
             print(f"[INIT] Connected to Futures Demo. Using symbol: {self.active_symbol}")
@@ -429,10 +440,9 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === 正确的仓位计算: 100% 权益 * 杠杆 ===
+        # === CORRECT POSITION SIZING: 100% EQUITY * LEVERAGE ===
         equity = self.account.total_equity
-        # 关键修复: 期望仓位价值 = 权益 * 杠杆 (而非权益 * 1)
-        desired_position_value = equity * LEVERAGE  # 例: 4,375 USDT * 10 = 43,750 USDT
+        desired_position_value = equity * LEVERAGE   # e.g., 4913.83 * 10 = 49138.3
         quantity = desired_position_value / price
 
         if self.step_size:
@@ -473,7 +483,7 @@ class OilBot:
             quantity = max_quantity
             position_value = max_position_value
 
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} ({POSITION_PERCENT*100:.0f}% of equity with {LEVERAGE}x leverage) | Size: {quantity:.8f}", flush=True)
+        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} (100% of equity with {LEVERAGE}x leverage) | Size: {quantity:.8f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
 
         pos = self.account.position
