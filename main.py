@@ -217,7 +217,7 @@ class OilBot:
                     print(f"[WARN] Leverage attempt {attempt+1} failed: {e}")
                     time.sleep(1)
 
-            # ---- NEW: Set margin type to ISOLATED ----
+            # ---- Set margin type to ISOLATED ----
             for attempt in range(3):
                 try:
                     self.client.futures_change_margin_type(symbol=self.active_symbol, marginType='ISOLATED')
@@ -440,9 +440,9 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === CORRECT POSITION SIZING: 100% EQUITY * LEVERAGE ===
+        # === 100% EQUITY * LEVERAGE ===
         equity = self.account.total_equity
-        desired_position_value = equity * LEVERAGE   # e.g., 4913.83 * 10 = 49138.3
+        desired_position_value = equity * LEVERAGE
         quantity = desired_position_value / price
 
         if self.step_size:
@@ -450,6 +450,7 @@ class OilBot:
         quantity = round(quantity, 8)
         position_value = quantity * price
 
+        # Check minimums
         if self.min_notional is not None and position_value < self.min_notional:
             print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade with full account.", flush=True)
             return {"status": "error", "message": f"Position ${position_value:.2f} below min notional ${self.min_notional:.2f}"}
@@ -460,13 +461,20 @@ class OilBot:
 
         margin_required = position_value / LEVERAGE
         free_margin = self.account.free_margin
-        margin_buffer = free_margin * 0.005
+
+        # ---- NEW: Use 100% of free margin, only a tiny 0.01 USDT buffer to avoid dust ----
+        # This ensures the available balance becomes near zero.
+        margin_buffer = 0.01  # tiny buffer to avoid rounding errors
         required_with_buffer = margin_required + margin_buffer
 
         print(f"[MARGIN DEBUG] price: {price:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, buffer: ${margin_buffer:.2f}", flush=True)
 
         if required_with_buffer > free_margin:
-            max_margin_use = free_margin * 0.95
+            # Reduce position to fit exactly the free margin minus buffer
+            max_margin_use = free_margin - margin_buffer
+            if max_margin_use < 0:
+                print(f"[ERROR] Free margin too low to open any position (free: ${free_margin:.2f})", flush=True)
+                return {"status": "error", "message": "Insufficient free margin"}
             max_position_value = max_margin_use * LEVERAGE
             max_quantity = max_position_value / price
             if self.step_size:
