@@ -23,17 +23,17 @@ load_dotenv()
 # ==================== CONFIG ====================
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
-LEVERAGE = int(os.getenv("LEVERAGE", "1"))   # DEFAULT 1 – use full account as margin
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))   # 默认 10x 杠杆
 
-# Position sizing: use 100% of account equity as position value (notional)
-POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% of equity
+# 仓位大小: 使用账户权益的 100% 并应用杠杆
+POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% 的权益
 
-# SL and TP percentages (distance from entry)
-SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
+# SL 和 TP 百分比 (距离入场价)
+SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% 止损距离
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% 止盈距离
 
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # 备用
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
@@ -429,9 +429,10 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === 100% OF EQUITY AS POSITION VALUE ===
+        # === 正确的仓位计算: 100% 权益 * 杠杆 ===
         equity = self.account.total_equity
-        desired_position_value = equity * POSITION_PERCENT   # 1.0 = 100%
+        # 关键修复: 期望仓位价值 = 权益 * 杠杆 (而非权益 * 1)
+        desired_position_value = equity * LEVERAGE  # 例: 4,375 USDT * 10 = 43,750 USDT
         quantity = desired_position_value / price
 
         if self.step_size:
@@ -472,7 +473,7 @@ class OilBot:
             quantity = max_quantity
             position_value = max_position_value
 
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} ({POSITION_PERCENT*100:.0f}% of equity) | Size: {quantity:.8f}", flush=True)
+        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} ({POSITION_PERCENT*100:.0f}% of equity with {LEVERAGE}x leverage) | Size: {quantity:.8f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
 
         pos = self.account.position
