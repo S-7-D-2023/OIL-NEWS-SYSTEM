@@ -23,10 +23,10 @@ load_dotenv()
 # ==================== CONFIG ====================
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 
-# Position sizing: use 100% of account equity and apply leverage
-POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "1.0"))   # 100% of equity
+# NEW DEFAULTS: 20x leverage, 50% of account as margin
+LEVERAGE = int(os.getenv("LEVERAGE", "20"))
+POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))   # 50% of equity as margin
 
 # SL and TP percentages (distance from entry)
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
@@ -440,9 +440,10 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === 100% EQUITY * LEVERAGE ===
+        # === NEW POSITION SIZING: margin = POSITION_PERCENT * equity, leverage = LEVERAGE ===
         equity = self.account.total_equity
-        desired_position_value = equity * LEVERAGE
+        target_margin = equity * POSITION_PERCENT        # e.g., 0.5 * equity
+        desired_position_value = target_margin * LEVERAGE   # position notional
         quantity = desired_position_value / price
 
         if self.step_size:
@@ -452,19 +453,17 @@ class OilBot:
 
         # Check minimums
         if self.min_notional is not None and position_value < self.min_notional:
-            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade with full account.", flush=True)
+            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade with target margin.", flush=True)
             return {"status": "error", "message": f"Position ${position_value:.2f} below min notional ${self.min_notional:.2f}"}
 
         if self.min_qty is not None and quantity < self.min_qty:
-            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade with full account.", flush=True)
+            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade with target margin.", flush=True)
             return {"status": "error", "message": f"Quantity {quantity:.8f} below min {self.min_qty}"}
 
         margin_required = position_value / LEVERAGE
         free_margin = self.account.free_margin
 
-        # === FIX: Use 98% of free margin to leave buffer for fees and maintenance ===
-        # Binance needs extra margin for trading fees (0.04%) and maintenance margin
-        # Using 98% ensures there's always enough buffer
+        # Use 98% of free margin to keep buffer for fees (if needed)
         max_margin_use = free_margin * 0.98
         max_position_value = max_margin_use * LEVERAGE
         max_quantity = max_position_value / price
@@ -473,11 +472,11 @@ class OilBot:
         max_quantity = round(max_quantity, 8)
         max_position_value = max_quantity * price
 
-        print(f"[MARGIN DEBUG] price: {price:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, max_margin_use (98%): ${max_margin_use:.2f}", flush=True)
+        print(f"[MARGIN DEBUG] price: {price:.2f}, target margin: ${target_margin:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, max_margin_use (98%): ${max_margin_use:.2f}", flush=True)
 
         # If desired position exceeds max allowed by margin, reduce it
         if position_value > max_position_value:
-            print(f"[MARGIN] Reducing position from ${position_value:.2f} to ${max_position_value:.2f} (using 98% of margin)", flush=True)
+            print(f"[MARGIN] Reducing position from ${position_value:.2f} to ${max_position_value:.2f} (using 98% of available margin)", flush=True)
             logging.warning(f"Reduced position from ${position_value:.2f} to ${max_position_value:.2f} to leave margin buffer")
             quantity = max_quantity
             position_value = max_position_value
@@ -487,7 +486,7 @@ class OilBot:
             print(f"[ERROR] After margin adjustment, position would be below minimum. Cannot trade.", flush=True)
             return {"status": "error", "message": "Position below minimum after margin adjustment"}
 
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f} (100% of equity with {LEVERAGE}x leverage) | Size: {quantity:.8f}", flush=True)
+        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Margin used: ${position_value/LEVERAGE:.2f} ({POSITION_PERCENT*100:.0f}% of equity) | Leverage: {LEVERAGE}x | Position: ${position_value:.2f} | Size: {quantity:.8f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
 
         pos = self.account.position
