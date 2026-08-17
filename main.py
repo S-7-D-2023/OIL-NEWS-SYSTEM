@@ -24,9 +24,10 @@ load_dotenv()
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 
-# NEW DEFAULTS: 20x leverage, 50% of account as margin
+# NEW DEFAULTS: 20x leverage, 50% of account as margin, 1-second cooldown
 LEVERAGE = int(os.getenv("LEVERAGE", "20"))
 POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))   # 50% of equity as margin
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1"))      # REDUCED from 60 to 1 second
 
 # SL and TP percentages (distance from entry)
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
@@ -35,7 +36,6 @@ TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit dis
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
@@ -224,8 +224,13 @@ class OilBot:
                     logging.info(f"Margin type set to ISOLATED for {self.active_symbol}")
                     break
                 except Exception as e:
-                    print(f"[WARN] Margin type attempt {attempt+1} failed: {e}")
-                    time.sleep(1)
+                    # If already isolated, just log and continue
+                    if "No need to change margin type" in str(e):
+                        logging.info("Margin type already ISOLATED")
+                        break
+                    else:
+                        print(f"[WARN] Margin type attempt {attempt+1} failed: {e}")
+                        time.sleep(1)
 
             print(f"[INIT] Connected to Futures Demo. Using symbol: {self.active_symbol}")
             logging.info(f"Connected to Futures Demo. Symbol: {self.active_symbol}")
@@ -575,7 +580,7 @@ class OilBot:
         print("[START] Bot is ready. Waiting for manual news via /test endpoint.", flush=True)
         logging.info("=== BOT STARTED (MANUAL MODE) ===")
         while True:
-            time.sleep(60)
+            time.sleep(60)  # Keep process alive, but don't affect trade speed
 
 
 # ==================== HEALTH + MANUAL TEST SERVER ====================
