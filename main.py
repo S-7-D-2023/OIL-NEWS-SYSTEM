@@ -24,12 +24,11 @@ load_dotenv()
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 
-# NEW DEFAULTS: 20x leverage, 50% of account as margin, 1-second cooldown
-LEVERAGE = int(os.getenv("LEVERAGE", "20"))
+# DEFAULTS: 10x leverage, 50% margin, 1-second cooldown (or set via env)
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))   # 50% of equity as margin
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1"))      # REDUCED from 60 to 1 second
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1"))      # 1 second cooldown between trades
 
-# SL and TP percentages (distance from entry)
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
 
@@ -224,7 +223,6 @@ class OilBot:
                     logging.info(f"Margin type set to ISOLATED for {self.active_symbol}")
                     break
                 except Exception as e:
-                    # If already isolated, just log and continue
                     if "No need to change margin type" in str(e):
                         logging.info("Margin type already ISOLATED")
                         break
@@ -445,7 +443,12 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === NEW POSITION SIZING: margin = POSITION_PERCENT * equity, leverage = LEVERAGE ===
+        # === CHECK IF POSITION ALREADY OPEN – BLOCK NEW TRADES ===
+        if self.account.position != 0:
+            print(f"[SKIP] Position already open. Ignoring signal {signal.value}.", flush=True)
+            return {"status": "position_active", "message": "Position already open. Ignoring signal."}
+
+        # === POSITION SIZING: margin = POSITION_PERCENT * equity, leverage = LEVERAGE ===
         equity = self.account.total_equity
         target_margin = equity * POSITION_PERCENT        # e.g., 0.5 * equity
         desired_position_value = target_margin * LEVERAGE   # position notional
@@ -494,93 +497,42 @@ class OilBot:
         print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Margin used: ${position_value/LEVERAGE:.2f} ({POSITION_PERCENT*100:.0f}% of equity) | Leverage: {LEVERAGE}x | Position: ${position_value:.2f} | Size: {quantity:.8f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
 
-        pos = self.account.position
-        trade_result = {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity, "position_value": position_value}
-
-        if pos == 0:
-            if signal == Signal.BULL:
-                side = SIDE_BUY
-                sl_side = SIDE_SELL
-                sl_price = price * (1 - SL_PERCENT)
-                tp_price = price * (1 + TP_PERCENT)
-            else:
-                side = SIDE_SELL
-                sl_side = SIDE_BUY
-                sl_price = price * (1 + SL_PERCENT)
-                tp_price = price * (1 - TP_PERCENT)
-
-            market_ok = self.place_market_order(side, quantity)
-            if market_ok:
-                self.sl_price = sl_price
-                self.tp_price = tp_price
-                sl_ok = self.place_stop_order(sl_side, quantity, sl_price)
-                tp_ok = self.place_tp_order(sl_side, quantity, tp_price)
-                if not sl_ok or not tp_ok:
-                    print("[WARN] Algo SL/TP failed, starting manual monitor.")
-                    self.stop_monitoring = False
-                    if self.monitor_thread is None or not self.monitor_thread.is_alive():
-                        self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
-                        self.monitor_thread.start()
-                self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
-                trade_result["action"] = "opened"
-                trade_result["sl"] = sl_price
-                trade_result["tp"] = tp_price
-            else:
-                trade_result["status"] = "order_failed"
+        # Now we open the position (only if position is zero, already checked)
+        if signal == Signal.BULL:
+            side = SIDE_BUY
+            sl_side = SIDE_SELL
+            sl_price = price * (1 - SL_PERCENT)
+            tp_price = price * (1 + TP_PERCENT)
         else:
-            if (pos > 0 and signal == Signal.BULL) or (pos < 0 and signal == Signal.BEAR):
-                print("[HOLD] Same direction.")
-                trade_result["status"] = "hold"
-            else:
-                print("[REVERSE] Opposite signal – closing and reversing.")
-                logging.info("Reversing position")
-                self.stop_monitoring = True
-                if self.monitor_thread and self.monitor_thread.is_alive():
-                    self.monitor_thread.join(timeout=2)
+            side = SIDE_SELL
+            sl_side = SIDE_BUY
+            sl_price = price * (1 + SL_PERCENT)
+            tp_price = price * (1 - TP_PERCENT)
 
-                close_side = SIDE_SELL if pos > 0 else SIDE_BUY
-                close_qty = abs(pos)
-                self.place_market_order(close_side, close_qty)
-                self.account.close_position(price)
-
-                if signal == Signal.BULL:
-                    side = SIDE_BUY
-                    sl_side = SIDE_SELL
-                    sl_price = price * (1 - SL_PERCENT)
-                    tp_price = price * (1 + TP_PERCENT)
-                else:
-                    side = SIDE_SELL
-                    sl_side = SIDE_BUY
-                    sl_price = price * (1 + SL_PERCENT)
-                    tp_price = price * (1 - TP_PERCENT)
-
-                if self.place_market_order(side, quantity):
-                    self.sl_price = sl_price
-                    self.tp_price = tp_price
-                    sl_ok = self.place_stop_order(sl_side, quantity, sl_price)
-                    tp_ok = self.place_tp_order(sl_side, quantity, tp_price)
-                    if not sl_ok or not tp_ok:
-                        print("[WARN] Algo SL/TP failed, starting manual monitor.")
-                        self.stop_monitoring = False
-                        if self.monitor_thread is None or not self.monitor_thread.is_alive():
-                            self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
-                            self.monitor_thread.start()
-                    self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
-                    trade_result["action"] = "reversed"
-                    trade_result["sl"] = sl_price
-                    trade_result["tp"] = tp_price
-                else:
-                    trade_result["status"] = "order_failed"
-
-        self.last_trade_time = time.time()
-        return trade_result
+        market_ok = self.place_market_order(side, quantity)
+        if market_ok:
+            self.sl_price = sl_price
+            self.tp_price = tp_price
+            sl_ok = self.place_stop_order(sl_side, quantity, sl_price)
+            tp_ok = self.place_tp_order(sl_side, quantity, tp_price)
+            if not sl_ok or not tp_ok:
+                print("[WARN] Algo SL/TP failed, starting manual monitor.")
+                self.stop_monitoring = False
+                if self.monitor_thread is None or not self.monitor_thread.is_alive():
+                    self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
+                    self.monitor_thread.start()
+            self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
+            self.last_trade_time = time.time()
+            return {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity, "position_value": position_value}
+        else:
+            return {"status": "order_failed"}
 
     def run(self):
         self.init_binance()
         print("[START] Bot is ready. Waiting for manual news via /test endpoint.", flush=True)
         logging.info("=== BOT STARTED (MANUAL MODE) ===")
         while True:
-            time.sleep(60)  # Keep process alive, but don't affect trade speed
+            time.sleep(60)  # Keep process alive
 
 
 # ==================== HEALTH + MANUAL TEST SERVER ====================
