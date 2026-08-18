@@ -24,10 +24,10 @@ load_dotenv()
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 
-# DEFAULTS: 10x leverage, 50% margin, 1-second cooldown (or set via env)
-LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+# LEVERAGE = 20x (hardcoded default, can be overridden by env)
+LEVERAGE = int(os.getenv("LEVERAGE", "20"))           # <<-- RESTORED TO 20x
 POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))   # 50% of equity as margin
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1"))      # 1 second cooldown between trades
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1"))      # 1 second cooldown
 
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
@@ -443,14 +443,14 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === CHECK IF POSITION ALREADY OPEN – BLOCK NEW TRADES ===
+        # === BLOCK NEW TRADES IF POSITION OPEN ===
         if self.account.position != 0:
             print(f"[SKIP] Position already open. Ignoring signal {signal.value}.", flush=True)
             return {"status": "position_active", "message": "Position already open. Ignoring signal."}
 
         # === POSITION SIZING: margin = POSITION_PERCENT * equity, leverage = LEVERAGE ===
         equity = self.account.total_equity
-        target_margin = equity * POSITION_PERCENT        # e.g., 0.5 * equity
+        target_margin = equity * POSITION_PERCENT        # 0.5 * equity
         desired_position_value = target_margin * LEVERAGE   # position notional
         quantity = desired_position_value / price
 
@@ -461,17 +461,17 @@ class OilBot:
 
         # Check minimums
         if self.min_notional is not None and position_value < self.min_notional:
-            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade with target margin.", flush=True)
+            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade.", flush=True)
             return {"status": "error", "message": f"Position ${position_value:.2f} below min notional ${self.min_notional:.2f}"}
 
         if self.min_qty is not None and quantity < self.min_qty:
-            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade with target margin.", flush=True)
+            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade.", flush=True)
             return {"status": "error", "message": f"Quantity {quantity:.8f} below min {self.min_qty}"}
 
         margin_required = position_value / LEVERAGE
         free_margin = self.account.free_margin
 
-        # Use 98% of free margin to keep buffer for fees (if needed)
+        # Use 98% of free margin to keep buffer for fees
         max_margin_use = free_margin * 0.98
         max_position_value = max_margin_use * LEVERAGE
         max_quantity = max_position_value / price
@@ -497,7 +497,7 @@ class OilBot:
         print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Margin used: ${position_value/LEVERAGE:.2f} ({POSITION_PERCENT*100:.0f}% of equity) | Leverage: {LEVERAGE}x | Position: ${position_value:.2f} | Size: {quantity:.8f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
 
-        # Now we open the position (only if position is zero, already checked)
+        # Open position
         if signal == Signal.BULL:
             side = SIDE_BUY
             sl_side = SIDE_SELL
