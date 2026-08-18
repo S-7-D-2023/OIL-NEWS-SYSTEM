@@ -24,13 +24,18 @@ load_dotenv()
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 
-# LEVERAGE = 20x (hardcoded default, can be overridden by env)
-LEVERAGE = int(os.getenv("LEVERAGE", "20"))           # <<-- RESTORED TO 20x
-POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))   # 50% of equity as margin
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1"))      # 1 second cooldown
+# FORCE 20x LEVERAGE – ignore environment if set to 10
+ENV_LEVERAGE = int(os.getenv("LEVERAGE", "20"))
+LEVERAGE = 20 if ENV_LEVERAGE == 10 else ENV_LEVERAGE  # override 10 to 20
+if ENV_LEVERAGE == 10:
+    print("⚠️  WARNING: LEVERAGE env is 10, but we force 20x for your strategy.", flush=True)
+    logging.warning("LEVERAGE forced to 20x (env was 10)")
 
-SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss distance
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit distance
+POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))   # 50% of equity as margin
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))      # ZERO cooldown – instant trades
+
+SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit
 
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
 INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback
@@ -80,6 +85,25 @@ class FuturesAccount:
     def set_balance(self, real_balance):
         self.cash = real_balance
         self.initial_balance = real_balance
+
+    def sync_position(self, pos_info):
+        """Sync position from exchange data (pos_info = list from futures_position_information)"""
+        # Find the position for our symbol
+        for pos in pos_info:
+            if pos['symbol'] == self.active_symbol:
+                amount = float(pos['positionAmt'])
+                if amount != 0:
+                    self.position = amount
+                    self.entry_price = float(pos['entryPrice'])
+                    self.margin_used = float(pos['isolatedMargin']) if pos.get('isolatedMargin') else 0
+                    # Update cash? We'll keep it as is, but you might want to recalc.
+                    # Better to keep internal tracking separate; we just sync position and margin.
+                    # Also sync unrealized PnL? Not needed.
+                    return
+        # If no position found, set to zero
+        self.position = 0.0
+        self.entry_price = None
+        self.margin_used = 0.0
 
     def open_position(self, side, amount, price):
         position_value = amount * price
@@ -165,6 +189,8 @@ class OilBot:
         self.step_size = None
         self.min_notional = None
 
+        self.active_symbol = SYMBOL  # for sync
+
     def init_binance(self):
         try:
             self.client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
@@ -206,15 +232,13 @@ class OilBot:
             print(f"[INFO] Account balance updated to ${total_balance:.2f}", flush=True)
             logging.info(f"Real balance set to ${total_balance:.2f}")
 
-            # ---- Set leverage ----
-            for attempt in range(3):
-                try:
-                    self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
-                    logging.info(f"Leverage set to {LEVERAGE}x")
-                    break
-                except Exception as e:
-                    print(f"[WARN] Leverage attempt {attempt+1} failed: {e}")
-                    time.sleep(1)
+            # ---- Set leverage (force 20x) ----
+            # First, clear any existing leverage setting by setting it to 20
+            try:
+                self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
+                logging.info(f"Leverage set to {LEVERAGE}x")
+            except Exception as e:
+                print(f"[WARN] Leverage setting failed: {e}")
 
             # ---- Set margin type to ISOLATED ----
             for attempt in range(3):
@@ -228,7 +252,7 @@ class OilBot:
                         break
                     else:
                         print(f"[WARN] Margin type attempt {attempt+1} failed: {e}")
-                        time.sleep(1)
+                        time.sleep(0.5)
 
             print(f"[INIT] Connected to Futures Demo. Using symbol: {self.active_symbol}")
             logging.info(f"Connected to Futures Demo. Symbol: {self.active_symbol}")
@@ -251,19 +275,19 @@ class OilBot:
                 return price
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 2 ** (attempt + 1)
+                    wait = 0.5 * (2 ** attempt)  # 0.5, 1, 2 seconds
                     print(f"[RATE LIMIT] Waiting {wait}s before retry...")
                     time.sleep(wait)
                 else:
                     if attempt < 2:
-                        time.sleep(1)
+                        time.sleep(0.3)
                     else:
                         print(f"[ERROR] Price fetch failed: {e}")
                         logging.error(f"Price fetch failed: {e}")
                         return None
             except Exception as e:
                 if attempt < 2:
-                    time.sleep(1)
+                    time.sleep(0.3)
                 else:
                     print(f"[ERROR] Price fetch failed: {e}")
                     logging.error(f"Price fetch failed: {e}")
@@ -287,20 +311,20 @@ class OilBot:
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 2 ** (attempt + 1)
+                    wait = 0.5 * (2 ** attempt)
                     print(f"[RATE LIMIT] Waiting {wait}s before retry...")
                     time.sleep(wait)
                 else:
                     print(f"[MARKET ORDER ERROR] Attempt {attempt+1}: {e}")
                     if attempt < 2:
-                        time.sleep(1)
+                        time.sleep(0.5)
                     else:
                         logging.error(f"Market order failed: {e}")
                         return None
             except Exception as e:
                 print(f"[MARKET ORDER ERROR] Attempt {attempt+1}: {e}")
                 if attempt < 2:
-                    time.sleep(1)
+                    time.sleep(0.5)
                 else:
                     logging.error(f"Market order failed: {e}")
                     return None
@@ -328,20 +352,20 @@ class OilBot:
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 2 ** (attempt + 1)
+                    wait = 0.5 * (2 ** attempt)
                     print(f"[RATE LIMIT] Waiting {wait}s before retry...")
                     time.sleep(wait)
                 else:
                     print(f"[STOP ORDER ERROR] Attempt {attempt+1}: {e}")
                     if attempt < 2:
-                        time.sleep(1)
+                        time.sleep(0.5)
                     else:
                         logging.error(f"Stop order failed: {e}")
                         return None
             except Exception as e:
                 print(f"[STOP ORDER ERROR] Attempt {attempt+1}: {e}")
                 if attempt < 2:
-                    time.sleep(1)
+                    time.sleep(0.5)
                 else:
                     logging.error(f"Stop order failed: {e}")
                     return None
@@ -369,20 +393,20 @@ class OilBot:
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 2 ** (attempt + 1)
+                    wait = 0.5 * (2 ** attempt)
                     print(f"[RATE LIMIT] Waiting {wait}s before retry...")
                     time.sleep(wait)
                 else:
                     print(f"[TP ORDER ERROR] Attempt {attempt+1}: {e}")
                     if attempt < 2:
-                        time.sleep(1)
+                        time.sleep(0.5)
                     else:
                         logging.error(f"TP order failed: {e}")
                         return None
             except Exception as e:
                 print(f"[TP ORDER ERROR] Attempt {attempt+1}: {e}")
                 if attempt < 2:
-                    time.sleep(1)
+                    time.sleep(0.5)
                 else:
                     logging.error(f"TP order failed: {e}")
                     return None
@@ -395,7 +419,7 @@ class OilBot:
                 break
             current_price = self.fetch_price()
             if current_price is None:
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
             self.account.update_price(current_price)
 
@@ -421,15 +445,45 @@ class OilBot:
                     self.place_market_order(SIDE_BUY, abs(self.account.position))
                     self.account.close_position(current_price)
                     break
-            time.sleep(1)
+            time.sleep(0.5)
         print("[MONITOR] Monitor thread ended.")
+
+    def sync_position_from_exchange(self):
+        """Fetch current position from exchange and update internal state."""
+        try:
+            positions = self.client.futures_position_information(symbol=self.active_symbol)
+            # positions is a list, find the one for our symbol
+            for pos in positions:
+                if pos['symbol'] == self.active_symbol:
+                    amt = float(pos['positionAmt'])
+                    if amt != 0:
+                        self.account.position = amt
+                        self.account.entry_price = float(pos['entryPrice'])
+                        self.account.margin_used = float(pos.get('isolatedMargin', 0))
+                        # Also update cash? not necessary; will be recalculated on close.
+                        return
+            # If we reach here, no position
+            self.account.position = 0.0
+            self.account.entry_price = None
+            self.account.margin_used = 0.0
+        except Exception as e:
+            print(f"[WARN] Could not sync position: {e}")
 
     def execute_trade(self, signal):
         now = time.time()
         if now - self.last_trade_time < COOLDOWN_SECONDS:
             wait = COOLDOWN_SECONDS - (now - self.last_trade_time)
-            print(f"[COOLDOWN] Wait {wait:.1f}s")
+            if wait > 0:
+                print(f"[COOLDOWN] Wait {wait:.3f}s")
             return {"status": "cooldown", "wait": wait}
+
+        # ---- SYNC POSITION FROM EXCHANGE BEFORE ANYTHING ----
+        self.sync_position_from_exchange()
+
+        # ---- BLOCK NEW TRADES IF POSITION OPEN (after sync) ----
+        if self.account.position != 0:
+            print(f"[SKIP] Position already open. Ignoring signal {signal.value}.", flush=True)
+            return {"status": "position_active", "message": "Position already open. Ignoring signal."}
 
         price = self.fetch_price()
         if price is None:
@@ -442,11 +496,6 @@ class OilBot:
 
         self.consecutive_errors = 0
         self.account.update_price(price)
-
-        # === BLOCK NEW TRADES IF POSITION OPEN ===
-        if self.account.position != 0:
-            print(f"[SKIP] Position already open. Ignoring signal {signal.value}.", flush=True)
-            return {"status": "position_active", "message": "Position already open. Ignoring signal."}
 
         # === POSITION SIZING: margin = POSITION_PERCENT * equity, leverage = LEVERAGE ===
         equity = self.account.total_equity
@@ -521,6 +570,7 @@ class OilBot:
                 if self.monitor_thread is None or not self.monitor_thread.is_alive():
                     self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
                     self.monitor_thread.start()
+            # Open position in internal accounting
             self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
             self.last_trade_time = time.time()
             return {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity, "position_value": position_value}
