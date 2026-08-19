@@ -14,6 +14,7 @@ from binance.enums import *
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 from sentiment import get_sentiment, Signal
+from twitter_monitor import TwitterMonitor  # <-- NEW IMPORT
 
 # ---- Force unbuffered output ----
 sys.stdout.reconfigure(line_buffering=True)
@@ -24,9 +25,9 @@ load_dotenv()
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 
-# FORCE 20x LEVERAGE – ignore environment if set to 10
+# FORCE 20x LEVERAGE – ignore env if set to 10
 ENV_LEVERAGE = int(os.getenv("LEVERAGE", "20"))
-LEVERAGE = 20 if ENV_LEVERAGE == 10 else ENV_LEVERAGE  # override 10 to 20
+LEVERAGE = 20 if ENV_LEVERAGE == 10 else ENV_LEVERAGE
 if ENV_LEVERAGE == 10:
     print("⚠️  WARNING: LEVERAGE env is 10, but we force 20x for your strategy.", flush=True)
     logging.warning("LEVERAGE forced to 20x (env was 10)")
@@ -88,19 +89,14 @@ class FuturesAccount:
 
     def sync_position(self, pos_info):
         """Sync position from exchange data (pos_info = list from futures_position_information)"""
-        # Find the position for our symbol
         for pos in pos_info:
             if pos['symbol'] == self.active_symbol:
                 amount = float(pos['positionAmt'])
                 if amount != 0:
                     self.position = amount
                     self.entry_price = float(pos['entryPrice'])
-                    self.margin_used = float(pos['isolatedMargin']) if pos.get('isolatedMargin') else 0
-                    # Update cash? We'll keep it as is, but you might want to recalc.
-                    # Better to keep internal tracking separate; we just sync position and margin.
-                    # Also sync unrealized PnL? Not needed.
+                    self.margin_used = float(pos.get('isolatedMargin', 0))
                     return
-        # If no position found, set to zero
         self.position = 0.0
         self.entry_price = None
         self.margin_used = 0.0
@@ -189,7 +185,11 @@ class OilBot:
         self.step_size = None
         self.min_notional = None
 
-        self.active_symbol = SYMBOL  # for sync
+        # ---- Twitter Monitor ----
+        self.twitter_monitor = None
+        self.twitter_target = os.getenv("TWITTER_TARGET_USER")
+        self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN")
+        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "2"))
 
     def init_binance(self):
         try:
@@ -233,7 +233,6 @@ class OilBot:
             logging.info(f"Real balance set to ${total_balance:.2f}")
 
             # ---- Set leverage (force 20x) ----
-            # First, clear any existing leverage setting by setting it to 20
             try:
                 self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
                 logging.info(f"Leverage set to {LEVERAGE}x")
@@ -275,7 +274,7 @@ class OilBot:
                 return price
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 0.5 * (2 ** attempt)  # 0.5, 1, 2 seconds
+                    wait = 0.5 * (2 ** attempt)
                     print(f"[RATE LIMIT] Waiting {wait}s before retry...")
                     time.sleep(wait)
                 else:
@@ -452,7 +451,6 @@ class OilBot:
         """Fetch current position from exchange and update internal state."""
         try:
             positions = self.client.futures_position_information(symbol=self.active_symbol)
-            # positions is a list, find the one for our symbol
             for pos in positions:
                 if pos['symbol'] == self.active_symbol:
                     amt = float(pos['positionAmt'])
@@ -460,14 +458,45 @@ class OilBot:
                         self.account.position = amt
                         self.account.entry_price = float(pos['entryPrice'])
                         self.account.margin_used = float(pos.get('isolatedMargin', 0))
-                        # Also update cash? not necessary; will be recalculated on close.
                         return
-            # If we reach here, no position
             self.account.position = 0.0
             self.account.entry_price = None
             self.account.margin_used = 0.0
         except Exception as e:
             print(f"[WARN] Could not sync position: {e}")
+
+    def init_twitter_monitor(self):
+        if not self.twitter_target or not self.twitter_auth:
+            logging.warning("Twitter credentials missing. Twitter monitor disabled.")
+            return
+
+        self.twitter_monitor = TwitterMonitor(
+            target_user=self.twitter_target,
+            auth_token=self.twitter_auth,
+            poll_interval=self.twitter_interval
+        )
+
+        def on_new_tweet(tweet):
+            tweet_text = tweet.get('text', '')
+            logging.info(f"Processing tweet from @{self.twitter_target}: {tweet_text[:100]}...")
+            
+            # Use your existing sentiment function
+            signal = get_sentiment(tweet_text, conflict_mode=CONFLICT_MODE)
+            logging.info(f"Sentiment result: {signal.value}")
+            
+            if signal == Signal.NEUTRAL:
+                logging.info("Tweet neutral — no trade.")
+                return
+            
+            # Execute trade using your existing method
+            trade_result = self.execute_trade(signal)
+            logging.info(f"Trade result: {trade_result}")
+
+        success = self.twitter_monitor.start(on_new_tweet)
+        if success:
+            print(f"[TWITTER] Monitoring @{self.twitter_target} every {self.twitter_interval}s.", flush=True)
+        else:
+            print("[TWITTER] Failed to start monitor. Check auth token.", flush=True)
 
     def execute_trade(self, signal):
         now = time.time()
@@ -570,7 +599,6 @@ class OilBot:
                 if self.monitor_thread is None or not self.monitor_thread.is_alive():
                     self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
                     self.monitor_thread.start()
-            # Open position in internal accounting
             self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
             self.last_trade_time = time.time()
             return {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity, "position_value": position_value}
@@ -579,8 +607,9 @@ class OilBot:
 
     def run(self):
         self.init_binance()
-        print("[START] Bot is ready. Waiting for manual news via /test endpoint.", flush=True)
-        logging.info("=== BOT STARTED (MANUAL MODE) ===")
+        self.init_twitter_monitor()   # <-- START TWITTER MONITOR
+        print("[START] Bot is ready. Monitoring Twitter and waiting for signals.", flush=True)
+        logging.info("=== BOT STARTED (TWITTER + MANUAL MODE) ===")
         while True:
             time.sleep(60)  # Keep process alive
 
