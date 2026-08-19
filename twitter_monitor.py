@@ -4,10 +4,9 @@ import time
 import logging
 import threading
 from Scweet import Scweet
-from Scweet.scweet_db import ScweetDB
 
 class TwitterMonitor:
-    def __init__(self, target_user, auth_token, poll_interval=10):
+    def __init__(self, target_user, auth_token, poll_interval=15):
         self.target_user = target_user
         self.auth_token = auth_token
         self.poll_interval = poll_interval
@@ -17,16 +16,12 @@ class TwitterMonitor:
         self.thread = None
         self.callback = None
         self.reset_count = 0
-        self.max_resets = 3
+        self.max_resets = 5
 
     def init_scweet(self):
         try:
             self.scweet = Scweet(auth_token=self.auth_token)
             logging.info(f"TwitterMonitor initialized for @{self.target_user}")
-            # Log account status
-            db = ScweetDB()
-            accounts = db.inspect_accounts()
-            logging.info(f"Account status: {accounts}")
             return True
         except Exception as e:
             logging.error(f"Failed to init Scweet: {e}")
@@ -60,13 +55,15 @@ class TwitterMonitor:
         self.reset_count += 1
         logging.warning(f"Auto-reset #{self.reset_count} triggered. Deleting scweet_state.db...")
         try:
-            os.remove("scweet_state.db")
-            logging.info("scweet_state.db deleted.")
-        except FileNotFoundError:
-            logging.info("scweet_state.db not found, skipping delete.")
+            if os.path.exists("scweet_state.db"):
+                os.remove("scweet_state.db")
+                logging.info("scweet_state.db deleted.")
+            else:
+                logging.info("scweet_state.db not found, skipping delete.")
         except Exception as e:
             logging.error(f"Failed to delete scweet_state.db: {e}")
         # Reinitialize
+        time.sleep(2)  # wait a moment
         if self.init_scweet():
             logging.info("Scweet reinitialized after reset.")
         else:
