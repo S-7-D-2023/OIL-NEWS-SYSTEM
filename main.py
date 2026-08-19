@@ -14,7 +14,7 @@ from binance.enums import *
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 from sentiment import get_sentiment, Signal
-from twitter_monitor import TwitterMonitor  # <-- NEW IMPORT
+from twitter_monitor import TwitterMonitor
 
 # ---- Force unbuffered output ----
 sys.stdout.reconfigure(line_buffering=True)
@@ -25,7 +25,7 @@ load_dotenv()
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
 
-# FORCE 20x LEVERAGE – ignore env if set to 10
+# FORCE 20x LEVERAGE
 ENV_LEVERAGE = int(os.getenv("LEVERAGE", "20"))
 LEVERAGE = 20 if ENV_LEVERAGE == 10 else ENV_LEVERAGE
 if ENV_LEVERAGE == 10:
@@ -88,7 +88,6 @@ class FuturesAccount:
         self.initial_balance = real_balance
 
     def sync_position(self, pos_info):
-        """Sync position from exchange data (pos_info = list from futures_position_information)"""
         for pos in pos_info:
             if pos['symbol'] == self.active_symbol:
                 amount = float(pos['positionAmt'])
@@ -189,7 +188,7 @@ class OilBot:
         self.twitter_monitor = None
         self.twitter_target = os.getenv("TWITTER_TARGET_USER")
         self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN")
-        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "2"))
+        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))  # changed to 10s
 
     def init_binance(self):
         try:
@@ -448,7 +447,6 @@ class OilBot:
         print("[MONITOR] Monitor thread ended.")
 
     def sync_position_from_exchange(self):
-        """Fetch current position from exchange and update internal state."""
         try:
             positions = self.client.futures_position_information(symbol=self.active_symbol)
             for pos in positions:
@@ -480,7 +478,6 @@ class OilBot:
             tweet_text = tweet.get('text', '')
             logging.info(f"Processing tweet from @{self.twitter_target}: {tweet_text[:100]}...")
             
-            # Use your existing sentiment function
             signal = get_sentiment(tweet_text, conflict_mode=CONFLICT_MODE)
             logging.info(f"Sentiment result: {signal.value}")
             
@@ -488,7 +485,6 @@ class OilBot:
                 logging.info("Tweet neutral — no trade.")
                 return
             
-            # Execute trade using your existing method
             trade_result = self.execute_trade(signal)
             logging.info(f"Trade result: {trade_result}")
 
@@ -506,10 +502,8 @@ class OilBot:
                 print(f"[COOLDOWN] Wait {wait:.3f}s")
             return {"status": "cooldown", "wait": wait}
 
-        # ---- SYNC POSITION FROM EXCHANGE BEFORE ANYTHING ----
         self.sync_position_from_exchange()
 
-        # ---- BLOCK NEW TRADES IF POSITION OPEN (after sync) ----
         if self.account.position != 0:
             print(f"[SKIP] Position already open. Ignoring signal {signal.value}.", flush=True)
             return {"status": "position_active", "message": "Position already open. Ignoring signal."}
@@ -526,10 +520,9 @@ class OilBot:
         self.consecutive_errors = 0
         self.account.update_price(price)
 
-        # === POSITION SIZING: margin = POSITION_PERCENT * equity, leverage = LEVERAGE ===
         equity = self.account.total_equity
-        target_margin = equity * POSITION_PERCENT        # 0.5 * equity
-        desired_position_value = target_margin * LEVERAGE   # position notional
+        target_margin = equity * POSITION_PERCENT
+        desired_position_value = target_margin * LEVERAGE
         quantity = desired_position_value / price
 
         if self.step_size:
@@ -537,7 +530,6 @@ class OilBot:
         quantity = round(quantity, 8)
         position_value = quantity * price
 
-        # Check minimums
         if self.min_notional is not None and position_value < self.min_notional:
             print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade.", flush=True)
             return {"status": "error", "message": f"Position ${position_value:.2f} below min notional ${self.min_notional:.2f}"}
@@ -549,7 +541,6 @@ class OilBot:
         margin_required = position_value / LEVERAGE
         free_margin = self.account.free_margin
 
-        # Use 98% of free margin to keep buffer for fees
         max_margin_use = free_margin * 0.98
         max_position_value = max_margin_use * LEVERAGE
         max_quantity = max_position_value / price
@@ -560,14 +551,12 @@ class OilBot:
 
         print(f"[MARGIN DEBUG] price: {price:.2f}, target margin: ${target_margin:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, max_margin_use (98%): ${max_margin_use:.2f}", flush=True)
 
-        # If desired position exceeds max allowed by margin, reduce it
         if position_value > max_position_value:
             print(f"[MARGIN] Reducing position from ${position_value:.2f} to ${max_position_value:.2f} (using 98% of available margin)", flush=True)
             logging.warning(f"Reduced position from ${position_value:.2f} to ${max_position_value:.2f} to leave margin buffer")
             quantity = max_quantity
             position_value = max_position_value
 
-        # Final check: ensure position still meets minimums
         if position_value < self.min_notional or quantity < self.min_qty:
             print(f"[ERROR] After margin adjustment, position would be below minimum. Cannot trade.", flush=True)
             return {"status": "error", "message": "Position below minimum after margin adjustment"}
@@ -575,7 +564,6 @@ class OilBot:
         print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Margin used: ${position_value/LEVERAGE:.2f} ({POSITION_PERCENT*100:.0f}% of equity) | Leverage: {LEVERAGE}x | Position: ${position_value:.2f} | Size: {quantity:.8f}", flush=True)
         logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
 
-        # Open position
         if signal == Signal.BULL:
             side = SIDE_BUY
             sl_side = SIDE_SELL
@@ -607,11 +595,11 @@ class OilBot:
 
     def run(self):
         self.init_binance()
-        self.init_twitter_monitor()   # <-- START TWITTER MONITOR
+        self.init_twitter_monitor()
         print("[START] Bot is ready. Monitoring Twitter and waiting for signals.", flush=True)
         logging.info("=== BOT STARTED (TWITTER + MANUAL MODE) ===")
         while True:
-            time.sleep(60)  # Keep process alive
+            time.sleep(60)
 
 
 # ==================== HEALTH + MANUAL TEST SERVER ====================
