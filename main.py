@@ -188,7 +188,7 @@ class OilBot:
         self.twitter_monitor = None
         self.twitter_target = os.getenv("TWITTER_TARGET_USER")
         self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN")
-        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))  # changed to 10s
+        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "15"))
 
     def init_binance(self):
         try:
