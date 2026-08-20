@@ -21,6 +21,14 @@ sys.stdout.reconfigure(line_buffering=True)
 
 load_dotenv()
 
+# ==================== DEBUG: TWITTER ENV VARIABLES ====================
+print(f"[DEBUG] TWITTER_AUTH_TOKEN exists: {bool(os.getenv('TWITTER_AUTH_TOKEN'))}", flush=True)
+print(f"[DEBUG] TWITTER_AUTH_TOKEN_1 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_1'))}", flush=True)
+print(f"[DEBUG] TWITTER_AUTH_TOKEN_2 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_2'))}", flush=True)
+print(f"[DEBUG] TWITTER_AUTH_TOKEN_3 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_3'))}", flush=True)
+print(f"[DEBUG] TWITTER_TARGET_USER: {os.getenv('TWITTER_TARGET_USER')}", flush=True)
+print(f"[DEBUG] TWITTER_POLL_INTERVAL: {os.getenv('TWITTER_POLL_INTERVAL')}", flush=True)
+
 # ==================== CONFIG ====================
 SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
@@ -187,8 +195,13 @@ class OilBot:
         # ---- Twitter Monitor ----
         self.twitter_monitor = None
         self.twitter_target = os.getenv("TWITTER_TARGET_USER")
-        self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN")
-        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "15"))
+        self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN")  # may be None – TwitterMonitor handles it
+        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))
+
+        # ---- DEBUG: Log Twitter init values ----
+        print(f"[DEBUG] twitter_target: {self.twitter_target}", flush=True)
+        print(f"[DEBUG] twitter_auth exists: {bool(self.twitter_auth)}", flush=True)
+        print(f"[DEBUG] twitter_interval: {self.twitter_interval}", flush=True)
 
     def init_binance(self):
         try:
@@ -464,13 +477,16 @@ class OilBot:
             print(f"[WARN] Could not sync position: {e}")
 
     def init_twitter_monitor(self):
-        if not self.twitter_target or not self.twitter_auth:
-            logging.warning("Twitter credentials missing. Twitter monitor disabled.")
+        """Initialize Twitter monitor – auth tokens are read from env by TwitterMonitor."""
+        if not self.twitter_target:
+            logging.warning("Twitter target user missing. Twitter monitor disabled.")
             return
 
+        # Pass auth_token=None – TwitterMonitor will read from environment
+        # (TWITTER_AUTH_TOKEN_1, _2, _3, etc.)
         self.twitter_monitor = TwitterMonitor(
             target_user=self.twitter_target,
-            auth_token=self.twitter_auth,
+            auth_token=None,  # Not used – TwitterMonitor reads from env
             poll_interval=self.twitter_interval
         )
 
@@ -492,7 +508,7 @@ class OilBot:
         if success:
             print(f"[TWITTER] Monitoring @{self.twitter_target} every {self.twitter_interval}s.", flush=True)
         else:
-            print("[TWITTER] Failed to start monitor. Check auth token.", flush=True)
+            print("[TWITTER] Failed to start monitor. Check auth tokens.", flush=True)
 
     def execute_trade(self, signal):
         now = time.time()
