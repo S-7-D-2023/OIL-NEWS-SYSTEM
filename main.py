@@ -482,11 +482,9 @@ class OilBot:
             logging.warning("Twitter target user missing. Twitter monitor disabled.")
             return
 
-        # Pass auth_token=None – TwitterMonitor will read from environment
-        # (TWITTER_AUTH_TOKEN_1, _2, _3, etc.)
+        # === FIXED: Removed auth_token parameter ===
         self.twitter_monitor = TwitterMonitor(
             target_user=self.twitter_target,
-            auth_token=None,  # Not used – TwitterMonitor reads from env
             poll_interval=self.twitter_interval
         )
 
