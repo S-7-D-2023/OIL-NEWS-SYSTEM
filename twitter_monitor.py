@@ -26,15 +26,22 @@ class TwitterMonitor:
         while True:
             token = os.getenv(f"TWITTER_AUTH_TOKEN_{i}")
             if token:
+                logging.info(f"[TWITTER] Found token #{i} (length: {len(token)} chars)")
                 tokens.append(token)
                 i += 1
             else:
                 break
+        
         # If no numbered tokens, fallback to the single TWITTER_AUTH_TOKEN
         if not tokens:
             single = os.getenv("TWITTER_AUTH_TOKEN")
             if single:
+                logging.info(f"[TWITTER] Found single TWITTER_AUTH_TOKEN (length: {len(single)} chars)")
                 tokens.append(single)
+            else:
+                logging.error("[TWITTER] No auth tokens found in environment. Check your Render environment variables.")
+        
+        logging.info(f"[TWITTER] Total tokens loaded: {len(tokens)}")
         return tokens
 
     def _build_cookies_json(self, tokens):
@@ -64,13 +71,11 @@ class TwitterMonitor:
             else:
                 # Multiple accounts – write temp cookies.json and use multi-account
                 accounts = self._build_cookies_json(tokens)
-                # Create a temporary file in /tmp
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                     json.dump(accounts, f, indent=2)
                     temp_path = f.name
                 self.scweet = Scweet(cookies_file=temp_path)
                 logging.info(f"[TWITTER] Scweet initialized with multi-account pool (total={len(tokens)})")
-                # Store temp path to clean up later if needed (optional)
                 self._temp_file = temp_path
 
             logging.info(f"[TWITTER] Monitoring @{self.target_user}")
