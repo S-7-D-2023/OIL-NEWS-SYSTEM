@@ -5,7 +5,8 @@ import logging
 import threading
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+import json
+from datetime import datetime
 
 class TwitterMonitor:
     def __init__(self, target_user, poll_interval=10):
@@ -19,80 +20,113 @@ class TwitterMonitor:
         self.consecutive_errors = 0
         self.max_errors = 10
         
-        # Public Nitter instances – free, no auth, no rate limits
-        self.nitter_instances = [
-            "https://nitter.net",
-            "https://nitter.poast.org",
-            "https://nitter.lunar.icu",
-            "https://nitter.kavin.rocks",
-            "https://nitter.1d4.us",
-            "https://nitter.space",
-            "https://nitter.nl",
-            "https://nitter.mint.lgbt",
+        # LAYER 1: XCancel.com (working Nitter fork with RSS)
+        self.xcancel_instances = [
+            "https://xcancel.com",
+            "https://nitter.privacyredirect.com",
+            "https://nitter.tiekoetter.com",
         ]
         self.current_instance_index = 0
+        
+        # LAYER 2: Twitter Syndication API (no auth required)
+        self.syndication_url = "https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
 
-    def get_next_nitter_instance(self):
-        instance = self.nitter_instances[self.current_instance_index]
-        self.current_instance_index = (self.current_instance_index + 1) % len(self.nitter_instances)
-        return instance
-
-    def fetch_rss(self):
-        for attempt in range(len(self.nitter_instances)):
-            instance = self.nitter_instances[self.current_instance_index]
+    def _fetch_xcancel_rss(self):
+        """Layer 1: Try XCancel and other Nitter forks."""
+        for attempt in range(len(self.xcancel_instances)):
+            instance = self.xcancel_instances[self.current_instance_index]
             url = f"{instance}/{self.target_user}/rss"
             try:
-                logging.debug(f"[TWITTER] Fetching RSS from {url}")
+                logging.debug(f"[TWITTER] Trying XCancel RSS: {url}")
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 response = requests.get(url, headers=headers, timeout=10)
                 
                 if response.status_code == 200:
-                    # Parse XML manually
                     try:
                         root = ET.fromstring(response.content)
-                        # RSS namespace
-                        ns = {'': 'http://www.w3.org/2005/Atom'}  # Nitter uses Atom
-                        # Try to find entries
-                        entries = root.findall('.//{http://www.w3.org/2005/Atom}entry')
-                        if not entries:
-                            # Fallback to RSS 2.0 <item>
-                            entries = root.findall('.//item')
+                        entries = root.findall('.//item') or root.findall('.//{http://www.w3.org/2005/Atom}entry')
                         if entries:
-                            # Return the feed and entries list
-                            return {'entries': entries, 'namespace': ns}
+                            return entries
                         else:
-                            logging.warning(f"[TWITTER] No entries found in feed from {instance}")
+                            logging.warning(f"[TWITTER] No entries in feed from {instance}")
                     except ET.ParseError as e:
                         logging.warning(f"[TWITTER] XML parse error from {instance}: {e}")
                 else:
-                    logging.warning(f"[TWITTER] RSS feed from {instance} returned status {response.status_code}")
+                    logging.warning(f"[TWITTER] {instance} returned status {response.status_code}")
                 
-                # Rotate to next instance
-                self.current_instance_index = (self.current_instance_index + 1) % len(self.nitter_instances)
-                
+                self.current_instance_index = (self.current_instance_index + 1) % len(self.xcancel_instances)
             except Exception as e:
                 logging.warning(f"[TWITTER] Failed to fetch from {instance}: {e}")
-                self.current_instance_index = (self.current_instance_index + 1) % len(self.nitter_instances)
+                self.current_instance_index = (self.current_instance_index + 1) % len(self.xcancel_instances)
                 time.sleep(0.5)
-        
         return None
 
-    def get_latest_tweet(self):
+    def _fetch_syndication_api(self):
+        """Layer 2: Twitter's undocumented syndication API."""
         try:
-            result = self.fetch_rss()
-            if not result:
-                return None
-            entries = result['entries']
-            if not entries:
-                return None
+            url = self.syndication_url.format(username=self.target_user)
+            logging.debug(f"[TWITTER] Trying Syndication API: {url}")
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json'
+            }
+            response = requests.get(url, headers=headers, timeout=10)
             
-            # Take the first entry (newest)
-            entry = entries[0]
+            if response.status_code == 200:
+                data = response.json()
+                if data and 'items' in data and len(data['items']) > 0:
+                    return data['items']
+                else:
+                    logging.warning("[TWITTER] Syndication API returned empty items")
+            else:
+                logging.warning(f"[TWITTER] Syndication API returned status {response.status_code}")
+            return None
+        except Exception as e:
+            logging.warning(f"[TWITTER] Syndication API failed: {e}")
+            return None
+
+    def _fetch_rsshub(self):
+        """Layer 3: Public RSSHub instances."""
+        rsshub_instances = [
+            "https://rsshub.app",
+            "https://rsshub.rssforever.com",
+            "https://rss.fmed.xyz",
+        ]
+        for instance in rsshub_instances:
+            try:
+                url = f"{instance}/twitter/user/{self.target_user}"
+                logging.debug(f"[TWITTER] Trying RSSHub: {url}")
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                response = requests.get(url, headers=headers, timeout=10)
+                
+                if response.status_code == 200:
+                    try:
+                        root = ET.fromstring(response.content)
+                        entries = root.findall('.//item') or root.findall('.//{http://www.w3.org/2005/Atom}entry')
+                        if entries:
+                            return entries
+                    except ET.ParseError:
+                        pass
+                logging.warning(f"[TWITTER] RSSHub {instance} returned {response.status_code}")
+            except Exception as e:
+                logging.warning(f"[TWITTER] RSSHub {instance} failed: {e}")
+        return None
+
+    def _parse_entry(self, entry):
+        """Parse RSS entry or syndication item into tweet dict."""
+        try:
+            # If it's a syndication API item (JSON)
+            if isinstance(entry, dict):
+                tweet_id = entry.get('id_str') or str(entry.get('id', ''))
+                text = entry.get('text', '')
+                created_at = entry.get('created_at', '')
+                link = f"https://twitter.com/{self.target_user}/status/{tweet_id}" if tweet_id else ''
+                return {'id': tweet_id, 'text': text, 'created_at': created_at, 'link': link}
             
-            # Extract title and link
+            # If it's an XML element (RSS)
             title_elem = entry.find('title') or entry.find('{http://www.w3.org/2005/Atom}title')
             link_elem = entry.find('link') or entry.find('{http://www.w3.org/2005/Atom}link')
-            pub_elem = entry.find('published') or entry.find('pubDate') or entry.find('{http://www.w3.org/2005/Atom}published')
+            pub_elem = entry.find('pubDate') or entry.find('published') or entry.find('{http://www.w3.org/2005/Atom}published')
             
             title = title_elem.text.strip() if title_elem is not None and title_elem.text else ''
             link = link_elem.get('href') if link_elem is not None else ''
@@ -100,27 +134,40 @@ class TwitterMonitor:
                 link = link_elem.text.strip()
             pub_date = pub_elem.text.strip() if pub_elem is not None and pub_elem.text else ''
             
-            # Extract tweet ID from link (e.g., /username/status/123456789)
             tweet_id = None
             if '/status/' in link:
                 tweet_id = link.split('/status/')[-1]
             
-            if not title and not link:
-                return None
-            
-            # Clean title from HTML entities (optional)
             import html
             title = html.unescape(title)
             
-            return {
-                'id': tweet_id or str(int(time.time() * 1000)),
-                'text': title,
-                'created_at': pub_date,
-                'link': link
-            }
+            return {'id': tweet_id or str(int(time.time() * 1000)), 'text': title, 'created_at': pub_date, 'link': link}
         except Exception as e:
-            logging.error(f"[TWITTER] RSS parsing error: {e}")
+            logging.error(f"[TWITTER] Failed to parse entry: {e}")
             return None
+
+    def get_latest_tweet(self):
+        """Try all layers in order until one works."""
+        # Layer 1: XCancel RSS
+        entries = self._fetch_xcancel_rss()
+        if entries:
+            logging.debug("[TWITTER] Layer 1 (XCancel) succeeded")
+            return self._parse_entry(entries[0])
+        
+        # Layer 2: Syndication API
+        items = self._fetch_syndication_api()
+        if items:
+            logging.debug("[TWITTER] Layer 2 (Syndication API) succeeded")
+            return self._parse_entry(items[0])
+        
+        # Layer 3: RSSHub
+        entries = self._fetch_rsshub()
+        if entries:
+            logging.debug("[TWITTER] Layer 3 (RSSHub) succeeded")
+            return self._parse_entry(entries[0])
+        
+        logging.warning("[TWITTER] All layers failed to fetch tweets")
+        return None
 
     def start(self, callback):
         if not self.target_user:
@@ -131,8 +178,8 @@ class TwitterMonitor:
         self.running = True
         self.thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.thread.start()
-        logging.info(f"[TWITTER] Started — polling @{self.target_user} via Nitter every {self.poll_interval}s")
-        logging.info(f"[TWITTER] Nitter instances: {len(self.nitter_instances)} (will rotate on failure)")
+        logging.info(f"[TWITTER] Started — polling @{self.target_user} every {self.poll_interval}s")
+        logging.info(f"[TWITTER] Using triple fallback: XCancel → Syndication API → RSSHub")
         return True
 
     def stop(self):
