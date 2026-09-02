@@ -4,7 +4,7 @@ import time
 import logging
 import threading
 import requests
-import feedparser
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 class TwitterMonitor:
@@ -19,7 +19,7 @@ class TwitterMonitor:
         self.consecutive_errors = 0
         self.max_errors = 10
         
-        # List of public Nitter instances to rotate through
+        # Public Nitter instances – free, no auth, no rate limits
         self.nitter_instances = [
             "https://nitter.net",
             "https://nitter.poast.org",
@@ -33,30 +33,37 @@ class TwitterMonitor:
         self.current_instance_index = 0
 
     def get_next_nitter_instance(self):
-        """Rotate to next Nitter instance if current one fails."""
         instance = self.nitter_instances[self.current_instance_index]
         self.current_instance_index = (self.current_instance_index + 1) % len(self.nitter_instances)
         return instance
 
     def fetch_rss(self):
-        """Fetch RSS feed from Nitter with fallback rotation."""
         for attempt in range(len(self.nitter_instances)):
             instance = self.nitter_instances[self.current_instance_index]
             url = f"{instance}/{self.target_user}/rss"
             try:
                 logging.debug(f"[TWITTER] Fetching RSS from {url}")
-                # Use a timeout and proper User-Agent
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 response = requests.get(url, headers=headers, timeout=10)
                 
                 if response.status_code == 200:
-                    feed = feedparser.parse(response.content)
-                    if feed.entries and len(feed.entries) > 0:
-                        return feed
-                    else:
-                        logging.warning(f"[TWITTER] RSS feed from {instance} returned no entries.")
+                    # Parse XML manually
+                    try:
+                        root = ET.fromstring(response.content)
+                        # RSS namespace
+                        ns = {'': 'http://www.w3.org/2005/Atom'}  # Nitter uses Atom
+                        # Try to find entries
+                        entries = root.findall('.//{http://www.w3.org/2005/Atom}entry')
+                        if not entries:
+                            # Fallback to RSS 2.0 <item>
+                            entries = root.findall('.//item')
+                        if entries:
+                            # Return the feed and entries list
+                            return {'entries': entries, 'namespace': ns}
+                        else:
+                            logging.warning(f"[TWITTER] No entries found in feed from {instance}")
+                    except ET.ParseError as e:
+                        logging.warning(f"[TWITTER] XML parse error from {instance}: {e}")
                 else:
                     logging.warning(f"[TWITTER] RSS feed from {instance} returned status {response.status_code}")
                 
@@ -71,52 +78,48 @@ class TwitterMonitor:
         return None
 
     def get_latest_tweet(self):
-        """Get latest tweet from RSS feed."""
         try:
-            feed = self.fetch_rss()
-            if not feed or not feed.entries:
+            result = self.fetch_rss()
+            if not result:
+                return None
+            entries = result['entries']
+            if not entries:
                 return None
             
-            # Get the first (newest) entry
-            entry = feed.entries[0]
+            # Take the first entry (newest)
+            entry = entries[0]
+            
+            # Extract title and link
+            title_elem = entry.find('title') or entry.find('{http://www.w3.org/2005/Atom}title')
+            link_elem = entry.find('link') or entry.find('{http://www.w3.org/2005/Atom}link')
+            pub_elem = entry.find('published') or entry.find('pubDate') or entry.find('{http://www.w3.org/2005/Atom}published')
+            
+            title = title_elem.text.strip() if title_elem is not None and title_elem.text else ''
+            link = link_elem.get('href') if link_elem is not None else ''
+            if not link and link_elem is not None and link_elem.text:
+                link = link_elem.text.strip()
+            pub_date = pub_elem.text.strip() if pub_elem is not None and pub_elem.text else ''
             
             # Extract tweet ID from link (e.g., /username/status/123456789)
-            link = entry.get('link', '')
             tweet_id = None
             if '/status/' in link:
                 tweet_id = link.split('/status/')[-1]
             
-            # Extract text from title or summary
-            title = entry.get('title', '')
-            summary = entry.get('summary', '')
-            # Clean HTML tags from summary
-            import re
-            summary = re.sub(r'<[^>]+>', '', summary)
-            text = title if title else summary
-            
-            if not text:
+            if not title and not link:
                 return None
             
-            # Parse published time
-            published = entry.get('published', '')
-            pub_time = None
-            if published:
-                try:
-                    pub_time = datetime.strptime(published, '%a, %d %b %Y %H:%M:%S %Z')
-                except:
-                    try:
-                        pub_time = datetime.strptime(published, '%Y-%m-%dT%H:%M:%S%z')
-                    except:
-                        pass
+            # Clean title from HTML entities (optional)
+            import html
+            title = html.unescape(title)
             
             return {
                 'id': tweet_id or str(int(time.time() * 1000)),
-                'text': text,
-                'created_at': published,
+                'text': title,
+                'created_at': pub_date,
                 'link': link
             }
         except Exception as e:
-            logging.error(f"[TWITTER] RSS fetch error: {e}")
+            logging.error(f"[TWITTER] RSS parsing error: {e}")
             return None
 
     def start(self, callback):
@@ -148,7 +151,6 @@ class TwitterMonitor:
                     tweet_id = tweet.get('id')
                     tweet_text = tweet.get('text', '')
                     
-                    # Check if this is a new tweet (by ID or by time)
                     if tweet_id and tweet_id != self.last_tweet_id:
                         logging.info(f"[TWITTER] NEW TWEET from @{self.target_user}: {tweet_text[:100]}...")
                         if self.callback:
