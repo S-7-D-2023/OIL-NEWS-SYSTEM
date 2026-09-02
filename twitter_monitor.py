@@ -8,7 +8,7 @@ import tempfile
 from Scweet import Scweet
 
 class TwitterMonitor:
-    def __init__(self, target_user, poll_interval=2):
+    def __init__(self, target_user, poll_interval=10):
         self.target_user = target_user
         self.poll_interval = poll_interval
         self.last_tweet_id = None
@@ -18,6 +18,9 @@ class TwitterMonitor:
         self.scweet = None
         self.consecutive_errors = 0
         self.max_errors = 10
+        self._temp_file = None
+        self.reset_count = 0
+        self.max_resets = 3
 
     def _get_auth_tokens_from_env(self):
         """Read all TWITTER_AUTH_TOKEN_1, _2, _3... from environment and return list."""
@@ -32,20 +35,19 @@ class TwitterMonitor:
             else:
                 break
         
-        # If no numbered tokens, fallback to the single TWITTER_AUTH_TOKEN
+        # If no numbered tokens, fallback to single TWITTER_AUTH_TOKEN
         if not tokens:
             single = os.getenv("TWITTER_AUTH_TOKEN")
             if single:
                 logging.info(f"[TWITTER] Found single TWITTER_AUTH_TOKEN (length: {len(single)} chars)")
                 tokens.append(single)
             else:
-                logging.error("[TWITTER] No auth tokens found in environment. Check your Render environment variables.")
+                logging.error("[TWITTER] No auth tokens found in environment.")
         
         logging.info(f"[TWITTER] Total tokens loaded: {len(tokens)}")
         return tokens
 
     def _build_cookies_json(self, tokens):
-        """Build a list of account dicts for Scweet multi-account format."""
         accounts = []
         for idx, token in enumerate(tokens, start=1):
             accounts.append({
@@ -56,36 +58,51 @@ class TwitterMonitor:
             })
         return accounts
 
-    def init_scweet(self):
+    def _force_reset_database(self):
+        """Delete the state database to force a fresh start."""
+        try:
+            # Scweet's database is in the current directory
+            db_paths = ["scweet_state.db", "scweet_state_0.db", "scweet_state_1.db"]
+            for path in db_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+                    logging.info(f"[TWITTER] Deleted {path}")
+            return True
+        except Exception as e:
+            logging.error(f"[TWITTER] Failed to delete database: {e}")
+            return False
+
+    def init_scweet(self, force_reset=False):
         """Initialize Scweet with either single auth_token or multi-account from env."""
         try:
+            if force_reset:
+                self._force_reset_database()
+
             tokens = self._get_auth_tokens_from_env()
             if not tokens:
                 logging.error("[TWITTER] No auth tokens found in environment.")
                 return False
 
             if len(tokens) == 1:
-                # Single account – use auth_token directly
                 self.scweet = Scweet(auth_token=tokens[0])
                 logging.info(f"[TWITTER] Scweet initialized with single account (total=1)")
             else:
-                # Multiple accounts – write temp cookies.json and use multi-account
                 accounts = self._build_cookies_json(tokens)
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                     json.dump(accounts, f, indent=2)
-                    temp_path = f.name
-                self.scweet = Scweet(cookies_file=temp_path)
+                    self._temp_file = f.name
+                self.scweet = Scweet(cookies_file=self._temp_file)
                 logging.info(f"[TWITTER] Scweet initialized with multi-account pool (total={len(tokens)})")
-                self._temp_file = temp_path
 
             logging.info(f"[TWITTER] Monitoring @{self.target_user}")
+            self.reset_count = 0
             return True
         except Exception as e:
             logging.error(f"[TWITTER] Failed to init Scweet: {e}")
             return False
 
     def get_latest_tweet(self):
-        """Get latest tweet using Scweet's GraphQL API with auto-account rotation."""
+        """Get latest tweet using Scweet's GraphQL API."""
         try:
             tweets = self.scweet.search(
                 f"from:{self.target_user}",
@@ -105,8 +122,18 @@ class TwitterMonitor:
         except Exception as e:
             error_msg = str(e)
             logging.error(f"[TWITTER] Scweet search error: {error_msg}")
+            
             if "No eligible accounts" in error_msg:
-                logging.warning("[TWITTER] All accounts rate-limited. Waiting longer...")
+                logging.warning("[TWITTER] All accounts rate-limited.")
+                if self.reset_count < self.max_resets:
+                    self.reset_count += 1
+                    logging.info(f"[TWITTER] Attempting reset #{self.reset_count}/{self.max_resets}...")
+                    if self.init_scweet(force_reset=True):
+                        logging.info("[TWITTER] Reset successful. Retrying...")
+                    else:
+                        logging.error("[TWITTER] Reset failed.")
+                else:
+                    logging.critical(f"[TWITTER] Max resets ({self.max_resets}) reached.")
             return None
 
     def start(self, callback):
