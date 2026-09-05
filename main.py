@@ -476,37 +476,40 @@ class OilBot:
         except Exception as e:
             print(f"[WARN] Could not sync position: {e}")
 
-    def init_twitter_monitor(self):
-        """Initialize Twitter monitor – auth tokens are read from env by TwitterMonitor."""
-        if not self.twitter_target:
-            logging.warning("Twitter target user missing. Twitter monitor disabled.")
+   # Inside OilBot.__init__, update the Twitter attributes:
+self.twitter_monitor = None
+self.twitter_target = os.getenv("TWITTER_TARGET_USER")
+self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN") or os.getenv("TWITTER_AUTH_TOKEN_1")
+self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))
+
+# Inside init_twitter_monitor():
+def init_twitter_monitor(self):
+    if not self.twitter_target or not self.twitter_auth:
+        logging.warning("Twitter credentials missing. Twitter monitor disabled.")
+        return
+
+    self.twitter_monitor = TwitterMonitor(
+        target_user=self.twitter_target,
+        auth_token=self.twitter_auth,
+        poll_interval=self.twitter_interval
+    )
+
+    def on_new_tweet(tweet):
+        tweet_text = tweet.get('text', '')
+        logging.info(f"Processing tweet from @{self.twitter_target}: {tweet_text[:100]}...")
+        signal = get_sentiment(tweet_text, conflict_mode=CONFLICT_MODE)
+        logging.info(f"Sentiment result: {signal.value}")
+        if signal == Signal.NEUTRAL:
+            logging.info("Tweet neutral — no trade.")
             return
+        trade_result = self.execute_trade(signal)
+        logging.info(f"Trade result: {trade_result}")
 
-        # === FIXED: Removed auth_token parameter ===
-        self.twitter_monitor = TwitterMonitor(
-            target_user=self.twitter_target,
-            poll_interval=self.twitter_interval
-        )
-
-        def on_new_tweet(tweet):
-            tweet_text = tweet.get('text', '')
-            logging.info(f"Processing tweet from @{self.twitter_target}: {tweet_text[:100]}...")
-            
-            signal = get_sentiment(tweet_text, conflict_mode=CONFLICT_MODE)
-            logging.info(f"Sentiment result: {signal.value}")
-            
-            if signal == Signal.NEUTRAL:
-                logging.info("Tweet neutral — no trade.")
-                return
-            
-            trade_result = self.execute_trade(signal)
-            logging.info(f"Trade result: {trade_result}")
-
-        success = self.twitter_monitor.start(on_new_tweet)
-        if success:
-            print(f"[TWITTER] Monitoring @{self.twitter_target} every {self.twitter_interval}s.", flush=True)
-        else:
-            print("[TWITTER] Failed to start monitor. Check auth tokens.", flush=True)
+    success = self.twitter_monitor.start(on_new_tweet)
+    if success:
+        print(f"[TWITTER] Monitoring @{self.twitter_target} every {self.twitter_interval}s using twifork.", flush=True)
+    else:
+        print("[TWITTER] Failed to start monitor. Check auth token.", flush=True)
 
     def execute_trade(self, signal):
         now = time.time()
