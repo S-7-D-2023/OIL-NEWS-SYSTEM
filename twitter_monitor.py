@@ -3,7 +3,7 @@ import os
 import time
 import logging
 import threading
-from twikit import Client  # FIXED: twifork installs as twikit
+from twikit import Client  # twifork installs as twikit
 
 class TwitterMonitor:
     def __init__(self, target_user, auth_token, poll_interval=10):
@@ -32,7 +32,9 @@ class TwitterMonitor:
     def get_latest_tweet(self):
         """Get the latest tweet from the target user using twifork."""
         try:
-            tweets = self.client.get_user_tweets(self.target_user, tweets_count=1)
+            # twifork/twikit signature: get_user_tweets(user_id, tweet_type)
+            # tweet_type can be 'Tweets', 'Replies', 'Media', 'Likes'
+            tweets = self.client.get_user_tweets(self.target_user, 'Tweets')
             if tweets and len(tweets) > 0:
                 tweet = tweets[0]
                 return {
