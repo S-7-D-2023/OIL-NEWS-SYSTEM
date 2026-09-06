@@ -24,7 +24,6 @@ class TwitterMonitor:
         """Initialize twifork Client with auth_token."""
         try:
             self.client = Client('en-US')
-            # auth_token and ct0 are enough for authentication
             self.client.set_cookies({'auth_token': self.auth_token})
             logging.info(f"[TWITTER] twifork client initialized for @{self.target_user}")
             return True
@@ -35,14 +34,14 @@ class TwitterMonitor:
     async def async_get_latest_tweet(self):
         """Async method to get the latest tweet."""
         try:
-            # Get user by screen name
+            # 获取用户对象
             user = await self.client.get_user_by_screen_name(self.target_user)
             if user is None:
                 logging.warning(f"[TWITTER] Could not find user @{self.target_user}")
                 return None
 
-            # Get tweets from the user
-            tweets = await user.get_tweets('Tweets', count=1)
+            # 使用 user.id 获取推文
+            tweets = await self.client.get_user_tweets(user.id, 'Tweets')
             if tweets and len(tweets) > 0:
                 tweet = tweets[0]
                 return {
