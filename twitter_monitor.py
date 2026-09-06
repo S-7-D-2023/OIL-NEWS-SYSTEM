@@ -21,6 +21,7 @@ class TwitterMonitor:
     def init_client(self):
         """Initialize twifork Client with auth_token."""
         try:
+            # Initialize the sync client
             self.client = Client()
             self.client.set_cookies({"auth_token": self.auth_token})
             logging.info(f"[TWITTER] twifork client initialized for @{self.target_user}")
@@ -32,9 +33,16 @@ class TwitterMonitor:
     def get_latest_tweet(self):
         """Get the latest tweet from the target user using twifork."""
         try:
-            # twifork/twikit signature: get_user_tweets(user_id, tweet_type)
-            # tweet_type can be 'Tweets', 'Replies', 'Media', 'Likes'
-            tweets = self.client.get_user_tweets(self.target_user, 'Tweets')
+            # Get the user timeline
+            # The sync client should work here
+            user = self.client.get_user_by_screen_name(self.target_user)
+            if user is None:
+                logging.warning(f"[TWITTER] Could not find user @{self.target_user}")
+                return None
+
+            # Get tweets from the user (limit to 1)
+            # The sync client's get_user_tweets should work
+            tweets = self.client.get_user_tweets(user.id, 'Tweets')
             if tweets and len(tweets) > 0:
                 tweet = tweets[0]
                 return {
