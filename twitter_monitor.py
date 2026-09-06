@@ -3,7 +3,8 @@ import os
 import time
 import logging
 import threading
-from twikit import Client  # twifork installs as twikit
+import asyncio
+from twikit import Client
 
 class TwitterMonitor:
     def __init__(self, target_user, auth_token, poll_interval=10):
@@ -15,34 +16,33 @@ class TwitterMonitor:
         self.thread = None
         self.callback = None
         self.client = None
+        self.loop = None
         self.consecutive_errors = 0
         self.max_errors = 10
 
     def init_client(self):
         """Initialize twifork Client with auth_token."""
         try:
-            # Initialize the sync client
-            self.client = Client()
-            self.client.set_cookies({"auth_token": self.auth_token})
+            self.client = Client('en-US')
+            # auth_token and ct0 are enough for authentication
+            self.client.set_cookies({'auth_token': self.auth_token})
             logging.info(f"[TWITTER] twifork client initialized for @{self.target_user}")
             return True
         except Exception as e:
             logging.error(f"[TWITTER] Failed to init twifork client: {e}")
             return False
 
-    def get_latest_tweet(self):
-        """Get the latest tweet from the target user using twifork."""
+    async def async_get_latest_tweet(self):
+        """Async method to get the latest tweet."""
         try:
-            # Get the user timeline
-            # The sync client should work here
-            user = self.client.get_user_by_screen_name(self.target_user)
+            # Get user by screen name
+            user = await self.client.get_user_by_screen_name(self.target_user)
             if user is None:
                 logging.warning(f"[TWITTER] Could not find user @{self.target_user}")
                 return None
 
-            # Get tweets from the user (limit to 1)
-            # The sync client's get_user_tweets should work
-            tweets = self.client.get_user_tweets(user.id, 'Tweets')
+            # Get tweets from the user
+            tweets = await user.get_tweets('Tweets', count=1)
             if tweets and len(tweets) > 0:
                 tweet = tweets[0]
                 return {
@@ -55,6 +55,13 @@ class TwitterMonitor:
         except Exception as e:
             logging.error(f"[TWITTER] twifork error: {e}")
             return None
+
+    def get_latest_tweet_sync(self):
+        """Synchronous wrapper for async_get_latest_tweet."""
+        if self.loop is None:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+        return self.loop.run_until_complete(self.async_get_latest_tweet())
 
     def start(self, callback):
         if not self.target_user:
@@ -73,20 +80,22 @@ class TwitterMonitor:
         self.running = True
         self.thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.thread.start()
-        logging.info(f"[TWITTER] Started — polling @{self.target_user} every {self.poll_interval}s using twifork")
+        logging.info(f"[TWITTER] Started — polling @{self.target_user} every {self.poll_interval}s using twifork (async)")
         return True
 
     def stop(self):
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)
+        if self.loop:
+            self.loop.close()
 
     def _poll_loop(self):
         consecutive_errors = 0
         while self.running:
             try:
                 logging.debug(f"[TWITTER] Polling @{self.target_user}...")
-                tweet = self.get_latest_tweet()
+                tweet = self.get_latest_tweet_sync()
 
                 if tweet:
                     tweet_id = tweet.get('id')
