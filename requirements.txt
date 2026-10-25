@@ -1,5 +1,4 @@
 python-binance>=1.0.36
 python-dotenv==1.0.0
 requests==2.34.2
-twifork[impersonate]>=0.1.0
-curl-cffi>=0.16.3
+twifork[impersonate]
