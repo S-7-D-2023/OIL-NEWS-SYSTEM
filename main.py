@@ -26,6 +26,7 @@ print(f"[DEBUG] TWITTER_AUTH_TOKEN exists: {bool(os.getenv('TWITTER_AUTH_TOKEN')
 print(f"[DEBUG] TWITTER_AUTH_TOKEN_1 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_1'))}", flush=True)
 print(f"[DEBUG] TWITTER_AUTH_TOKEN_2 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_2'))}", flush=True)
 print(f"[DEBUG] TWITTER_AUTH_TOKEN_3 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_3'))}", flush=True)
+print(f"[DEBUG] TWITTER_CT0 exists: {bool(os.getenv('TWITTER_CT0'))}", flush=True)
 print(f"[DEBUG] TWITTER_TARGET_USER: {os.getenv('TWITTER_TARGET_USER')}", flush=True)
 print(f"[DEBUG] TWITTER_POLL_INTERVAL: {os.getenv('TWITTER_POLL_INTERVAL')}", flush=True)
 
@@ -71,7 +72,7 @@ class FuturesAccount:
         self.leverage = LEVERAGE
         self.current_price = 0.0
         self.initial_balance = initial_balance
-        self.active_symbol = SYMBOL  # needed for sync
+        self.active_symbol = SYMBOL
 
     @property
     def total_equity(self):
@@ -196,13 +197,14 @@ class OilBot:
         # ---- Twitter Monitor ----
         self.twitter_monitor = None
         self.twitter_target = os.getenv("TWITTER_TARGET_USER")
-        # Try TWITTER_AUTH_TOKEN first, fallback to TWITTER_AUTH_TOKEN_1
         self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN") or os.getenv("TWITTER_AUTH_TOKEN_1")
+        self.twitter_ct0 = os.getenv("TWITTER_CT0")          # <-- ADDED FOR STEP 4
         self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))
 
         # ---- DEBUG: Log Twitter init values ----
         print(f"[DEBUG] twitter_target: {self.twitter_target}", flush=True)
         print(f"[DEBUG] twitter_auth exists: {bool(self.twitter_auth)}", flush=True)
+        print(f"[DEBUG] twitter_ct0 exists: {bool(self.twitter_ct0)}", flush=True)
         print(f"[DEBUG] twitter_interval: {self.twitter_interval}", flush=True)
 
     def init_binance(self):
@@ -479,14 +481,15 @@ class OilBot:
             print(f"[WARN] Could not sync position: {e}")
 
     def init_twitter_monitor(self):
-        """Initialize Twitter monitor with auth token."""
-        if not self.twitter_target or not self.twitter_auth:
-            logging.warning("Twitter credentials missing. Twitter monitor disabled.")
+        """Initialize Twitter monitor with auth_token AND ct0."""
+        if not self.twitter_target or not self.twitter_auth or not self.twitter_ct0:
+            logging.warning("Twitter credentials missing (need TARGET, AUTH_TOKEN, and CT0). Twitter monitor disabled.")
             return
 
         self.twitter_monitor = TwitterMonitor(
             target_user=self.twitter_target,
             auth_token=self.twitter_auth,
+            ct0=self.twitter_ct0,          # <-- STEP 4: pass ct0
             poll_interval=self.twitter_interval
         )
 
@@ -505,7 +508,7 @@ class OilBot:
         if success:
             print(f"[TWITTER] Monitoring @{self.twitter_target} every {self.twitter_interval}s using twifork.", flush=True)
         else:
-            print("[TWITTER] Failed to start monitor. Check auth token.", flush=True)
+            print("[TWITTER] Failed to start monitor. Check auth_token and ct0.", flush=True)
 
     def execute_trade(self, signal):
         now = time.time()
