@@ -198,7 +198,7 @@ class OilBot:
         self.twitter_monitor = None
         self.twitter_target = os.getenv("TWITTER_TARGET_USER")
         self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN") or os.getenv("TWITTER_AUTH_TOKEN_1")
-        self.twitter_ct0 = os.getenv("TWITTER_CT0")          # <-- ADDED FOR STEP 4
+        self.twitter_ct0 = os.getenv("TWITTER_CT0")
         self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))
 
         # ---- DEBUG: Log Twitter init values ----
@@ -489,7 +489,7 @@ class OilBot:
         self.twitter_monitor = TwitterMonitor(
             target_user=self.twitter_target,
             auth_token=self.twitter_auth,
-            ct0=self.twitter_ct0,          # <-- STEP 4: pass ct0
+            ct0=self.twitter_ct0,
             poll_interval=self.twitter_interval
         )
 
