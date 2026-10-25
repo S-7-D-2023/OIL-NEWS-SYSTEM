@@ -3,3 +3,5 @@ python-dotenv==1.0.0
 feedparser==6.0.10
 requests==2.34.2
 twifork>=0.1.0
+twifork[impersonate]>=0.1.0
+curl-cffi>=0.16.3
