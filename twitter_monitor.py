@@ -20,6 +20,7 @@ class TwitterMonitor:
         self.loop = None
         self.consecutive_errors = 0
         self.max_errors = 10
+        self.primed = False   # <-- NEW: don't trade on the first poll
 
     def init_client(self):
         try:
@@ -89,17 +90,40 @@ class TwitterMonitor:
         while self.running:
             try:
                 tweet = self.get_latest_tweet_sync()
+
                 if tweet:
                     tweet_id = tweet.get('id')
                     tweet_text = tweet.get('text', '')
+
+                    # ---- PRIME ON FIRST POLL: record baseline, DO NOT trade ----
+                    if not self.primed:
+                        self.last_tweet_id = tweet_id
+                        self.primed = True
+                        logging.info(f"[TWITTER] Primed. Baseline tweet ID = {tweet_id}. Waiting for NEW tweets only.")
+                        time.sleep(self.poll_interval)
+                        continue
+
+                    # ---- NORMAL FLOW: only trade if ID is different from baseline ----
                     if tweet_id and str(tweet_id) != str(self.last_tweet_id):
                         logging.info(f"[TWITTER] NEW TWEET from @{self.target_user}: {tweet_text[:100]}...")
                         if self.callback:
                             self.callback(tweet)
                         self.last_tweet_id = tweet_id
                         self.consecutive_errors = 0
+                    else:
+                        logging.debug("[TWITTER] No new tweet.")
                 else:
                     self.consecutive_errors += 1
+                    if self.consecutive_errors == 1:
+                        logging.info("[TWITTER] No tweet fetched this cycle.")
+                    elif self.consecutive_errors > 5:
+                        logging.warning(f"[TWITTER] {self.consecutive_errors} consecutive empty polls.")
+
+                if self.consecutive_errors > self.max_errors:
+                    backoff = min(self.poll_interval * 3, 60)
+                    logging.warning(f"[TWITTER] Backing off for {backoff}s due to {self.consecutive_errors} errors.")
+                    time.sleep(backoff)
+
                 time.sleep(self.poll_interval)
             except Exception as e:
                 msg = str(e)
