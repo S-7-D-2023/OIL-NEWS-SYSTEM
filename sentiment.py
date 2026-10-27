@@ -48,6 +48,21 @@ BULL_PHRASES = [
     "naval exercises", "military exercises", "warns ships to avoid",
     "commercial ships avoid", "military options remain available",
     "military options", "retaliation", "immediate retaliation",
+     "end the war",
+    "end war",
+    "calls for conditions to end",
+    "calls for meeting conditions",
+    "conditions to end the war",
+    "bring the war to an end",
+    "neither war nor peace",
+    "de-escalation",
+    "deescalation",
+    "ceasefire talks",
+    "peace negotiations",
+    "diplomatic solution",
+    "off-ramp",
+    "end the conflict",
+    "resolve the conflict",
     "hostile"
 ]
 
