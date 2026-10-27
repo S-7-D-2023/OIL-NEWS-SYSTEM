@@ -48,21 +48,6 @@ BULL_PHRASES = [
     "naval exercises", "military exercises", "warns ships to avoid",
     "commercial ships avoid", "military options remain available",
     "military options", "retaliation", "immediate retaliation",
-     "end the war",
-    "end war",
-    "calls for conditions to end",
-    "calls for meeting conditions",
-    "conditions to end the war",
-    "bring the war to an end",
-    "neither war nor peace",
-    "de-escalation",
-    "deescalation",
-    "ceasefire talks",
-    "peace negotiations",
-    "diplomatic solution",
-    "off-ramp",
-    "end the conflict",
-    "resolve the conflict",
     "hostile"
 ]
 
@@ -111,7 +96,15 @@ BEAR_PHRASES = [
     "accepts mediation", "mediation proposal",
     "not looking for war", "willingness to reduce tensions",
     "reduce regional tensions", "new round of negotiations",
-    "nuclear negotiations"
+    "nuclear negotiations",
+    # De-escalation / end-of-war phrases — BEARISH for oil
+    "end the war", "end war",
+    "calls for conditions to end", "calls for meeting conditions",
+    "conditions to end the war", "bring the war to an end",
+    "neither war nor peace", "de-escalation", "deescalation",
+    "ceasefire talks", "peace negotiations",
+    "diplomatic solution", "off-ramp",
+    "end the conflict", "resolve the conflict"
 ]
 
 BULL_WORDS = [
@@ -221,7 +214,7 @@ def get_sentiment(news_text, conflict_mode="BEAR_BIAS"):
             bull_matches.clear()
             break
 
-    # 5. Debug (logs will appear in Koyeb)
+    # 5. Debug
     if bull_matches:
         print(f"[SENTIMENT] BULL matches: {list(bull_matches)}")
     if bear_matches:
