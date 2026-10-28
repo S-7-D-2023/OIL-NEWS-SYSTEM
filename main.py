@@ -31,8 +31,9 @@ print(f"[DEBUG] TWITTER_TARGET_USER: {os.getenv('TWITTER_TARGET_USER')}", flush=
 print(f"[DEBUG] TWITTER_POLL_INTERVAL: {os.getenv('TWITTER_POLL_INTERVAL')}", flush=True)
 
 # ==================== CONFIG ====================
-SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
-FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BTCUSDT")
+# LIVE BZUSDT — Brent Crude Oil
+SYMBOL = os.getenv("SYMBOL", "BZUSDT")
+FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BZUSDT")
 
 # FORCE 20x LEVERAGE
 ENV_LEVERAGE = int(os.getenv("LEVERAGE", "20"))
@@ -44,11 +45,11 @@ if ENV_LEVERAGE == 10:
 POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))   # 50% of equity as margin
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))      # ZERO cooldown – instant trades
 
-SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # 10% stop loss
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # 10% take profit
+SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # controlled by Render env (0.01)
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # controlled by Render env (0.01)
 
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback only
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
@@ -201,7 +202,6 @@ class OilBot:
         self.twitter_ct0 = os.getenv("TWITTER_CT0")
         self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))
 
-        # ---- DEBUG: Log Twitter init values ----
         print(f"[DEBUG] twitter_target: {self.twitter_target}", flush=True)
         print(f"[DEBUG] twitter_auth exists: {bool(self.twitter_auth)}", flush=True)
         print(f"[DEBUG] twitter_ct0 exists: {bool(self.twitter_ct0)}", flush=True)
@@ -209,14 +209,14 @@ class OilBot:
 
     def init_binance(self):
         try:
-            self.client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET, testnet=True)
-            self.client.API_URL = 'https://testnet.binance.vision/api'
+            # ===== LIVE EXCHANGE — NO testnet=True =====
+            self.client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET)
 
             info = self.client.futures_exchange_info()
             symbols = [s['symbol'] for s in info['symbols']]
-            print(f"[DIAG] Futures exchange info OK. Symbols: {len(symbols)}", flush=True)
+            print(f"[DIAG] Live Futures OK. Symbols: {len(symbols)}", flush=True)
             if self.active_symbol not in symbols:
-                print(f"[WARN] {self.active_symbol} not on testnet. Trying fallback {FALLBACK_SYMBOL}...")
+                print(f"[WARN] {self.active_symbol} not on live exchange. Trying fallback {FALLBACK_SYMBOL}...")
                 logging.warning(f"{self.active_symbol} not found. Trying fallback.")
                 if FALLBACK_SYMBOL not in symbols:
                     print(f"[CRITICAL] Neither symbol found. Exiting.")
@@ -234,16 +234,17 @@ class OilBot:
                             self.min_notional = float(f['notional'])
                     break
 
+            # BZUSDT fallback filters (only used if exchange info fails)
             if self.min_qty is None:
-                self.min_qty = 0.001
-                self.step_size = 0.001
+                self.min_qty = 0.01
+                self.step_size = 0.01
                 self.min_notional = 5.0
 
             print(f"[DIAG] Symbol filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
 
             account = self.client.futures_account()
             total_balance = float(account.get('totalWalletBalance', 0))
-            print(f"[DIAG] Futures account access OK. Total Wallet Balance: ${total_balance:.2f}", flush=True)
+            print(f"[DIAG] Live Account OK. Total Wallet Balance: ${total_balance:.2f}", flush=True)
             self.account.set_balance(total_balance)
             print(f"[INFO] Account balance updated to ${total_balance:.2f}", flush=True)
             logging.info(f"Real balance set to ${total_balance:.2f}")
@@ -269,10 +270,10 @@ class OilBot:
                         print(f"[WARN] Margin type attempt {attempt+1} failed: {e}")
                         time.sleep(0.5)
 
-            print(f"[INIT] Connected to Futures Demo. Using symbol: {self.active_symbol}")
-            logging.info(f"Connected to Futures Demo. Symbol: {self.active_symbol}")
+            print(f"[INIT] Connected to LIVE Futures. Using symbol: {self.active_symbol}")
+            logging.info(f"Connected to LIVE Futures. Symbol: {self.active_symbol}")
         except Exception as e:
-            print(f"[ERROR] Cannot connect to Binance Futures Demo: {e}")
+            print(f"[ERROR] Cannot connect to Binance Live Futures: {e}")
             logging.error(f"Connection failed: {e}")
             exit(1)
 
@@ -612,8 +613,8 @@ class OilBot:
     def run(self):
         self.init_binance()
         self.init_twitter_monitor()
-        print("[START] Bot is ready. Monitoring Twitter and waiting for signals.", flush=True)
-        logging.info("=== BOT STARTED (TWITTER + MANUAL MODE) ===")
+        print("[START] LIVE BOT is ready. Monitoring Twitter and waiting for signals.", flush=True)
+        logging.info("=== LIVE BOT STARTED (TWITTER + MANUAL MODE) ===")
         while True:
             time.sleep(60)
 
