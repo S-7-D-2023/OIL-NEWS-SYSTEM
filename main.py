@@ -1,66 +1,76 @@
 import os
 import time
 import json
-import re
-import random
 import logging
 import sys
-from enum import Enum
-from datetime import datetime, timedelta
+import re
+from datetime import datetime
 import requests
-import xml.etree.ElementTree as ET
 from binance.client import Client as BinanceClient
 from binance.enums import *
 from binance.exceptions import BinanceAPIException
+from binance.streams import ThreadedWebsocketManager
 from dotenv import load_dotenv
 from sentiment import get_sentiment, Signal
 from twitter_monitor import TwitterMonitor
 
-# ---- Force unbuffered output ----
 sys.stdout.reconfigure(line_buffering=True)
-
 load_dotenv()
 
-# ==================== DEBUG: TWITTER ENV VARIABLES ====================
+# ==================== DEBUG ====================
 print(f"[DEBUG] TWITTER_AUTH_TOKEN exists: {bool(os.getenv('TWITTER_AUTH_TOKEN'))}", flush=True)
-print(f"[DEBUG] TWITTER_AUTH_TOKEN_1 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_1'))}", flush=True)
-print(f"[DEBUG] TWITTER_AUTH_TOKEN_2 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_2'))}", flush=True)
-print(f"[DEBUG] TWITTER_AUTH_TOKEN_3 exists: {bool(os.getenv('TWITTER_AUTH_TOKEN_3'))}", flush=True)
 print(f"[DEBUG] TWITTER_CT0 exists: {bool(os.getenv('TWITTER_CT0'))}", flush=True)
 print(f"[DEBUG] TWITTER_TARGET_USER: {os.getenv('TWITTER_TARGET_USER')}", flush=True)
-print(f"[DEBUG] TWITTER_POLL_INTERVAL: {os.getenv('TWITTER_POLL_INTERVAL')}", flush=True)
 
 # ==================== CONFIG ====================
-# LIVE BZUSDT — Brent Crude Oil
 SYMBOL = os.getenv("SYMBOL", "BZUSDT")
 FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BZUSDT")
 
-# FORCE 20x LEVERAGE
 ENV_LEVERAGE = int(os.getenv("LEVERAGE", "20"))
 LEVERAGE = 20 if ENV_LEVERAGE == 10 else ENV_LEVERAGE
 if ENV_LEVERAGE == 10:
     print("⚠️  WARNING: LEVERAGE env is 10, but we force 20x for your strategy.", flush=True)
-    logging.warning("LEVERAGE forced to 20x (env was 10)")
 
-POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))   # 50% of equity as margin
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))      # ZERO cooldown – instant trades
-
-SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))        # controlled by Render env (0.01)
-TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))        # controlled by Render env (0.01)
-
+POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))
+SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))
+TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))   # fallback only
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
 
-# ==================== LOGGING SETUP ====================
-logging.basicConfig(
-    stream=sys.stdout,
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def parse_ban_until_ms(exc):
+    msg = str(exc)
+    m = re.search(r'banned until (\d{13})', msg)
+    return int(m.group(1)) if m else None
+
+
+def safe_binance_call(func, *args, max_wait_sec=3600, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except BinanceAPIException as e:
+        if e.code == -1003:
+            ban_until_ms = parse_ban_until_ms(e)
+            now_ms = int(time.time() * 1000)
+            if ban_until_ms:
+                wait_sec = max(5, (ban_until_ms - now_ms) // 1000 + 5)
+                if wait_sec <= max_wait_sec:
+                    print(f"[BAN] IP banned. Waiting {wait_sec}s...", flush=True)
+                    time.sleep(wait_sec)
+                    return func(*args, **kwargs)
+                raise RuntimeError(f"IP ban lasts {wait_sec}s") from e
+            print("[BAN] IP banned (no timestamp). Waiting 120s...", flush=True)
+            time.sleep(120)
+            return func(*args, **kwargs)
+        raise
+
 
 # ==================== FuturesAccount ====================
 class FuturesAccount:
@@ -115,9 +125,7 @@ class FuturesAccount:
         position_value = amount * price
         margin_req = position_value / self.leverage
         if not self.can_open(margin_req):
-            msg = "Not enough free margin."
-            print(f"[ERROR] {msg}")
-            logging.error(msg)
+            print(f"[ERROR] Not enough free margin.", flush=True)
             return None
         self.cash -= margin_req
         self.margin_used += margin_req
@@ -133,9 +141,7 @@ class FuturesAccount:
             self.entry_price = price
         fee = position_value * FEE_RATE
         self.cash -= fee
-        msg = f"Opened. Margin: ${margin_req:.2f} | Free: ${self.free_margin:.2f}"
-        print(f"[ACCOUNT] {msg}")
-        logging.info(msg)
+        print(f"[ACCOUNT] Opened. Margin: ${margin_req:.2f} | Free: ${self.free_margin:.2f}", flush=True)
         return True
 
     def close_position(self, price):
@@ -153,9 +159,7 @@ class FuturesAccount:
         self.position = 0
         self.entry_price = None
         self.realized_pnl += pnl
-        msg = f"CLOSE LONG - PnL: ${pnl:.2f} | Fee: ${fee:.2f}"
-        print(f"[{msg}]")
-        logging.info(msg)
+        print(f"[CLOSE LONG] PnL: ${pnl:.2f} | Fee: ${fee:.2f}", flush=True)
 
     def _close_short_internal(self, price):
         amount = -self.position
@@ -166,9 +170,7 @@ class FuturesAccount:
         self.position = 0
         self.entry_price = None
         self.realized_pnl += pnl
-        msg = f"CLOSE SHORT - PnL: ${pnl:.2f} | Fee: ${fee:.2f}"
-        print(f"[{msg}]")
-        logging.info(msg)
+        print(f"[CLOSE SHORT] PnL: ${pnl:.2f} | Fee: {fee:.2f}", flush=True)
 
 
 # ==================== OIL BOT ====================
@@ -178,49 +180,99 @@ class OilBot:
         self.account = FuturesAccount(INITIAL_CAPITAL)
         self.last_trade_time = 0
         self.active_symbol = SYMBOL
-        self.seen_guids = set()
         self.consecutive_errors = 0
         self.max_consecutive_errors = 5
-
         self._price_cache = None
         self._price_cache_time = 0
         self._price_cache_ttl = 2
-
         self.sl_price = None
         self.tp_price = None
         self.monitor_thread = None
         self.stop_monitoring = False
-
         self.min_qty = None
         self.step_size = None
         self.min_notional = None
 
-        # ---- Twitter Monitor ----
+        # ---- WEBSOCKET PRICE FEED ----
+        self._ws_price = None          # live price from WebSocket
+        self._ws_manager = None        # ThreadedWebsocketManager reference
+        self._ws_stream_key = None     # stream key, for clean shutdown
+
         self.twitter_monitor = None
         self.twitter_target = os.getenv("TWITTER_TARGET_USER")
         self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN") or os.getenv("TWITTER_AUTH_TOKEN_1")
         self.twitter_ct0 = os.getenv("TWITTER_CT0")
         self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))
-
-        print(f"[DEBUG] twitter_target: {self.twitter_target}", flush=True)
-        print(f"[DEBUG] twitter_auth exists: {bool(self.twitter_auth)}", flush=True)
         print(f"[DEBUG] twitter_ct0 exists: {bool(self.twitter_ct0)}", flush=True)
-        print(f"[DEBUG] twitter_interval: {self.twitter_interval}", flush=True)
+
+    def sign_tradfi_agreement(self):
+        """One-time signing of TradFi-Perps agreement (required for BZUSDT)."""
+        import hmac, hashlib
+        try:
+            timestamp = int(time.time() * 1000)
+            params_str = f"timestamp={timestamp}"
+            signature = hmac.new(
+                BINANCE_SECRET.encode('utf-8'),
+                params_str.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+
+            url = "https://fapi.binance.com/fapi/v1/stock/contract"
+            headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
+            payload = {"timestamp": timestamp, "signature": signature}
+
+            r = requests.post(url, headers=headers, params=payload, timeout=10)
+            if r.status_code == 200 and "SUCCESS" in r.text:
+                print("[INIT] TradFi-Perps agreement signed successfully.", flush=True)
+            else:
+                print(f"[WARN] TradFi agreement signing: {r.status_code} {r.text}", flush=True)
+        except Exception as e:
+            print(f"[WARN] TradFi agreement signing failed: {e}", flush=True)
+
+    def start_ws_price_stream(self):
+        """Start the mark-price WebSocket. Public stream, no auth, no REST budget."""
+        try:
+            self._ws_manager = ThreadedWebsocketManager(
+                api_key=BINANCE_API_KEY,
+                api_secret=BINANCE_SECRET
+            )
+            self._ws_manager.start()
+
+            def handle_mark_price(msg):
+                # markPriceUpdate event: 'p' = mark price
+                if isinstance(msg, dict) and msg.get('e') == 'markPriceUpdate':
+                    try:
+                        self._ws_price = float(msg['p'])
+                    except (KeyError, ValueError):
+                        pass
+
+            self._ws_stream_key = self._ws_manager.start_symbol_mark_price_socket(
+                symbol=self.active_symbol,
+                callback=handle_mark_price
+            )
+            print(f"[WS] Mark price stream started for {self.active_symbol}", flush=True)
+        except Exception as e:
+            print(f"[WARN] WebSocket start failed: {e} — REST fallback remains active", flush=True)
+            self._ws_manager = None
 
     def init_binance(self):
         try:
-            # ===== LIVE EXCHANGE — NO testnet=True =====
             self.client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET)
 
-            info = self.client.futures_exchange_info()
+            # Sign TradFi agreement first (required for BZUSDT)
+            self.sign_tradfi_agreement()
+
+            # ===== START WEBSOCKET BEFORE ANY REST PRICE CALL =====
+            self.start_ws_price_stream()
+
+            info = safe_binance_call(self.client.futures_exchange_info)
             symbols = [s['symbol'] for s in info['symbols']]
             print(f"[DIAG] Live Futures OK. Symbols: {len(symbols)}", flush=True)
+
             if self.active_symbol not in symbols:
-                print(f"[WARN] {self.active_symbol} not on live exchange. Trying fallback {FALLBACK_SYMBOL}...")
-                logging.warning(f"{self.active_symbol} not found. Trying fallback.")
+                print(f"[WARN] {self.active_symbol} not found. Trying fallback {FALLBACK_SYMBOL}...", flush=True)
                 if FALLBACK_SYMBOL not in symbols:
-                    print(f"[CRITICAL] Neither symbol found. Exiting.")
-                    logging.critical("No valid symbols found.")
+                    print(f"[CRITICAL] Neither symbol found. Exiting.", flush=True)
                     exit(1)
                 self.active_symbol = FALLBACK_SYMBOL
 
@@ -234,54 +286,53 @@ class OilBot:
                             self.min_notional = float(f['notional'])
                     break
 
-            # BZUSDT fallback filters (only used if exchange info fails)
             if self.min_qty is None:
                 self.min_qty = 0.01
                 self.step_size = 0.01
                 self.min_notional = 5.0
 
-            print(f"[DIAG] Symbol filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
+            print(f"[DIAG] Filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
 
-            account = self.client.futures_account()
+            account = safe_binance_call(self.client.futures_account)
             total_balance = float(account.get('totalWalletBalance', 0))
-            print(f"[DIAG] Live Account OK. Total Wallet Balance: ${total_balance:.2f}", flush=True)
+            print(f"[DIAG] Wallet Balance: ${total_balance:.2f}", flush=True)
             self.account.set_balance(total_balance)
-            print(f"[INFO] Account balance updated to ${total_balance:.2f}", flush=True)
-            logging.info(f"Real balance set to ${total_balance:.2f}")
 
-            # ---- Set leverage (force 20x) ----
             try:
-                self.client.futures_change_leverage(symbol=self.active_symbol, leverage=LEVERAGE)
-                logging.info(f"Leverage set to {LEVERAGE}x")
+                safe_binance_call(self.client.futures_change_leverage,
+                                  symbol=self.active_symbol, leverage=LEVERAGE)
+                print(f"[INIT] Leverage set to {LEVERAGE}x", flush=True)
             except Exception as e:
-                print(f"[WARN] Leverage setting failed: {e}")
+                print(f"[WARN] Leverage setting: {e}", flush=True)
 
-            # ---- Set margin type to ISOLATED ----
             for attempt in range(3):
                 try:
-                    self.client.futures_change_margin_type(symbol=self.active_symbol, marginType='ISOLATED')
-                    logging.info(f"Margin type set to ISOLATED for {self.active_symbol}")
+                    safe_binance_call(self.client.futures_change_margin_type,
+                                      symbol=self.active_symbol, marginType='ISOLATED')
+                    print(f"[INIT] Margin type ISOLATED", flush=True)
                     break
                 except Exception as e:
                     if "No need to change margin type" in str(e):
-                        logging.info("Margin type already ISOLATED")
+                        print(f"[INIT] Margin type already ISOLATED", flush=True)
                         break
-                    else:
-                        print(f"[WARN] Margin type attempt {attempt+1} failed: {e}")
-                        time.sleep(0.5)
+                    print(f"[WARN] Margin type attempt {attempt+1}: {e}", flush=True)
+                    time.sleep(1)
 
-            print(f"[INIT] Connected to LIVE Futures. Using symbol: {self.active_symbol}")
-            logging.info(f"Connected to LIVE Futures. Symbol: {self.active_symbol}")
+            print(f"[INIT] Connected to LIVE Futures. Symbol: {self.active_symbol}", flush=True)
+
         except Exception as e:
-            print(f"[ERROR] Cannot connect to Binance Live Futures: {e}")
-            logging.error(f"Connection failed: {e}")
+            print(f"[ERROR] Cannot connect to Live Futures: {e}", flush=True)
             exit(1)
 
     def fetch_price(self):
-        now = time.time()
-        if self._price_cache is not None and (now - self._price_cache_time) < self._price_cache_ttl:
-            return self._price_cache
+        # ===== PRIMARY: WebSocket live mark price =====
+        if self._ws_price is not None and self._ws_price > 0:
+            return self._ws_price
 
+        # ===== FALLBACK: REST (only until first WebSocket tick) =====
+        now = time.time()
+        if self._price_cache and (now - self._price_cache_time) < self._price_cache_ttl:
+            return self._price_cache
         for attempt in range(3):
             try:
                 ticker = self.client.futures_symbol_ticker(symbol=self.active_symbol)
@@ -291,22 +342,20 @@ class OilBot:
                 return price
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 0.5 * (2 ** attempt)
-                    print(f"[RATE LIMIT] Waiting {wait}s before retry...")
-                    time.sleep(wait)
+                    ban_until = parse_ban_until_ms(e)
+                    if ban_until:
+                        wait = max(5, (ban_until - int(time.time() * 1000)) // 1000 + 5)
+                        print(f"[BAN] Price fetch banned. Waiting {wait}s...", flush=True)
+                        time.sleep(wait)
+                elif attempt < 2:
+                    time.sleep(0.5)
                 else:
-                    if attempt < 2:
-                        time.sleep(0.3)
-                    else:
-                        print(f"[ERROR] Price fetch failed: {e}")
-                        logging.error(f"Price fetch failed: {e}")
-                        return None
-            except Exception as e:
+                    print(f"[ERROR] Price fetch failed: {e}", flush=True)
+                    return None
+            except Exception:
                 if attempt < 2:
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                 else:
-                    print(f"[ERROR] Price fetch failed: {e}")
-                    logging.error(f"Price fetch failed: {e}")
                     return None
         return None
 
@@ -317,32 +366,26 @@ class OilBot:
         for attempt in range(3):
             try:
                 order = self.client.futures_create_order(
-                    symbol=self.active_symbol,
-                    side=side,
-                    type=FUTURE_ORDER_TYPE_MARKET,
-                    quantity=quantity
-                )
-                print(f"[MARKET ORDER] {order}")
-                logging.info(f"MARKET ORDER: {order}")
+                    symbol=self.active_symbol, side=side,
+                    type=FUTURE_ORDER_TYPE_MARKET, quantity=quantity)
+                print(f"[MARKET ORDER] {order}", flush=True)
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 0.5 * (2 ** attempt)
-                    print(f"[RATE LIMIT] Waiting {wait}s before retry...")
-                    time.sleep(wait)
+                    ban_until = parse_ban_until_ms(e)
+                    if ban_until:
+                        wait = max(5, (ban_until - int(time.time() * 1000)) // 1000 + 5)
+                        print(f"[BAN] Order banned. Waiting {wait}s...", flush=True)
+                        time.sleep(wait)
+                elif attempt < 2:
+                    time.sleep(0.5)
                 else:
-                    print(f"[MARKET ORDER ERROR] Attempt {attempt+1}: {e}")
-                    if attempt < 2:
-                        time.sleep(0.5)
-                    else:
-                        logging.error(f"Market order failed: {e}")
-                        return None
-            except Exception as e:
-                print(f"[MARKET ORDER ERROR] Attempt {attempt+1}: {e}")
+                    print(f"[MARKET ORDER ERROR] {e}", flush=True)
+                    return None
+            except Exception:
                 if attempt < 2:
                     time.sleep(0.5)
                 else:
-                    logging.error(f"Market order failed: {e}")
                     return None
         return None
 
@@ -353,37 +396,31 @@ class OilBot:
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
-                    symbol=self.active_symbol,
-                    side=side,
+                    symbol=self.active_symbol, side=side,
                     type=FUTURE_ORDER_TYPE_STOP_MARKET,
                     quantity=quantity,
                     triggerPrice=round(stop_price, 2),
                     workingType='MARK_PRICE',
                     reduceOnly=True,
                     algoType='CONDITIONAL',
-                    priceProtect=True,
-                )
-                print(f"[STOP LOSS] ✅ ORDER PLACED - AlgoId: {order.get('algoId', 'N/A')} | Trigger: ${stop_price:.2f}")
-                logging.info(f"STOP LOSS PLACED: {order}")
+                    priceProtect=True)
+                print(f"[STOP LOSS] ✅ AlgoId: {order.get('algoId', 'N/A')} | Trigger: ${stop_price:.2f}", flush=True)
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 0.5 * (2 ** attempt)
-                    print(f"[RATE LIMIT] Waiting {wait}s before retry...")
-                    time.sleep(wait)
+                    ban_until = parse_ban_until_ms(e)
+                    if ban_until:
+                        wait = max(5, (ban_until - int(time.time() * 1000)) // 1000 + 5)
+                        time.sleep(wait)
+                elif attempt < 2:
+                    time.sleep(0.5)
                 else:
-                    print(f"[STOP ORDER ERROR] Attempt {attempt+1}: {e}")
-                    if attempt < 2:
-                        time.sleep(0.5)
-                    else:
-                        logging.error(f"Stop order failed: {e}")
-                        return None
-            except Exception as e:
-                print(f"[STOP ORDER ERROR] Attempt {attempt+1}: {e}")
+                    print(f"[STOP ORDER ERROR] {e}", flush=True)
+                    return None
+            except Exception:
                 if attempt < 2:
                     time.sleep(0.5)
                 else:
-                    logging.error(f"Stop order failed: {e}")
                     return None
         return None
 
@@ -394,75 +431,33 @@ class OilBot:
         for attempt in range(3):
             try:
                 order = self.client.futures_create_algo_order(
-                    symbol=self.active_symbol,
-                    side=side,
+                    symbol=self.active_symbol, side=side,
                     type=FUTURE_ORDER_TYPE_TAKE_PROFIT_MARKET,
                     quantity=quantity,
                     triggerPrice=round(tp_price, 2),
                     workingType='MARK_PRICE',
                     reduceOnly=True,
                     algoType='CONDITIONAL',
-                    priceProtect=True,
-                )
-                print(f"[TAKE PROFIT] ✅ ORDER PLACED - AlgoId: {order.get('algoId', 'N/A')} | Trigger: ${tp_price:.2f}")
-                logging.info(f"TAKE PROFIT PLACED: {order}")
+                    priceProtect=True)
+                print(f"[TAKE PROFIT] ✅ AlgoId: {order.get('algoId', 'N/A')} | Trigger: ${tp_price:.2f}", flush=True)
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    wait = 0.5 * (2 ** attempt)
-                    print(f"[RATE LIMIT] Waiting {wait}s before retry...")
-                    time.sleep(wait)
+                    ban_until = parse_ban_until_ms(e)
+                    if ban_until:
+                        wait = max(5, (ban_until - int(time.time() * 1000)) // 1000 + 5)
+                        time.sleep(wait)
+                elif attempt < 2:
+                    time.sleep(0.5)
                 else:
-                    print(f"[TP ORDER ERROR] Attempt {attempt+1}: {e}")
-                    if attempt < 2:
-                        time.sleep(0.5)
-                    else:
-                        logging.error(f"TP order failed: {e}")
-                        return None
-            except Exception as e:
-                print(f"[TP ORDER ERROR] Attempt {attempt+1}: {e}")
+                    print(f"[TP ORDER ERROR] {e}", flush=True)
+                    return None
+            except Exception:
                 if attempt < 2:
                     time.sleep(0.5)
                 else:
-                    logging.error(f"TP order failed: {e}")
                     return None
         return None
-
-    def monitor_position(self):
-        print("[MONITOR] Starting position monitor thread.")
-        while not self.stop_monitoring:
-            if self.account.position == 0:
-                break
-            current_price = self.fetch_price()
-            if current_price is None:
-                time.sleep(0.5)
-                continue
-            self.account.update_price(current_price)
-
-            if self.account.position > 0:
-                if current_price <= self.sl_price:
-                    print(f"[SL HIT] Long closed at ${current_price:.2f}")
-                    self.place_market_order(SIDE_SELL, abs(self.account.position))
-                    self.account.close_position(current_price)
-                    break
-                elif current_price >= self.tp_price:
-                    print(f"[TP HIT] Long closed at ${current_price:.2f}")
-                    self.place_market_order(SIDE_SELL, abs(self.account.position))
-                    self.account.close_position(current_price)
-                    break
-            elif self.account.position < 0:
-                if current_price >= self.sl_price:
-                    print(f"[SL HIT] Short closed at ${current_price:.2f}")
-                    self.place_market_order(SIDE_BUY, abs(self.account.position))
-                    self.account.close_position(current_price)
-                    break
-                elif current_price <= self.tp_price:
-                    print(f"[TP HIT] Short closed at ${current_price:.2f}")
-                    self.place_market_order(SIDE_BUY, abs(self.account.position))
-                    self.account.close_position(current_price)
-                    break
-            time.sleep(0.5)
-        print("[MONITOR] Monitor thread ended.")
 
     def sync_position_from_exchange(self):
         try:
@@ -479,116 +474,95 @@ class OilBot:
             self.account.entry_price = None
             self.account.margin_used = 0.0
         except Exception as e:
-            print(f"[WARN] Could not sync position: {e}")
+            print(f"[WARN] Could not sync position: {e}", flush=True)
 
     def init_twitter_monitor(self):
-        """Initialize Twitter monitor with auth_token AND ct0."""
         if not self.twitter_target or not self.twitter_auth or not self.twitter_ct0:
-            logging.warning("Twitter credentials missing (need TARGET, AUTH_TOKEN, and CT0). Twitter monitor disabled.")
+            print("[TWITTER] Credentials missing. Monitor disabled.", flush=True)
             return
-
         self.twitter_monitor = TwitterMonitor(
             target_user=self.twitter_target,
             auth_token=self.twitter_auth,
             ct0=self.twitter_ct0,
-            poll_interval=self.twitter_interval
-        )
+            poll_interval=self.twitter_interval)
 
         def on_new_tweet(tweet):
-            tweet_text = tweet.get('text', '')
-            logging.info(f"Processing tweet from @{self.twitter_target}: {tweet_text[:100]}...")
-            signal = get_sentiment(tweet_text, conflict_mode=CONFLICT_MODE)
-            logging.info(f"Sentiment result: {signal.value}")
+            text = tweet.get('text', '')
+            print(f"\n[TWITTER] NEW TWEET: {text[:120]}...", flush=True)
+            signal = get_sentiment(text, conflict_mode=CONFLICT_MODE)
+            print(f"[SENTIMENT] {signal.value}", flush=True)
             if signal == Signal.NEUTRAL:
-                logging.info("Tweet neutral — no trade.")
+                print("[SKIP] Neutral — no trade.", flush=True)
                 return
-            trade_result = self.execute_trade(signal)
-            logging.info(f"Trade result: {trade_result}")
+            self.execute_trade(signal)
 
-        success = self.twitter_monitor.start(on_new_tweet)
-        if success:
-            print(f"[TWITTER] Monitoring @{self.twitter_target} every {self.twitter_interval}s using twifork.", flush=True)
+        if self.twitter_monitor.start(on_new_tweet):
+            print(f"[TWITTER] Monitoring @{self.twitter_target} every {self.twitter_interval}s", flush=True)
         else:
-            print("[TWITTER] Failed to start monitor. Check auth_token and ct0.", flush=True)
+            print("[TWITTER] Failed to start.", flush=True)
 
     def execute_trade(self, signal):
         now = time.time()
         if now - self.last_trade_time < COOLDOWN_SECONDS:
-            wait = COOLDOWN_SECONDS - (now - self.last_trade_time)
-            if wait > 0:
-                print(f"[COOLDOWN] Wait {wait:.3f}s")
-            return {"status": "cooldown", "wait": wait}
+            print(f"[COOLDOWN]", flush=True)
+            return
 
         self.sync_position_from_exchange()
-
         if self.account.position != 0:
-            print(f"[SKIP] Position already open. Ignoring signal {signal.value}.", flush=True)
-            return {"status": "position_active", "message": "Position already open. Ignoring signal."}
+            print(f"[SKIP] Position already open. Ignoring {signal.value}.", flush=True)
+            return
 
         price = self.fetch_price()
         if price is None:
-            self.consecutive_errors += 1
-            if self.consecutive_errors >= self.max_consecutive_errors:
-                print("[CRITICAL] Too many errors. Waiting 60s...")
-                time.sleep(60)
-                self.consecutive_errors = 0
-            return {"status": "error", "message": "Price fetch failed"}
+            return
 
-        self.consecutive_errors = 0
         self.account.update_price(price)
-
         equity = self.account.total_equity
         target_margin = equity * POSITION_PERCENT
-        desired_position_value = target_margin * LEVERAGE
-        quantity = desired_position_value / price
+        desired_value = target_margin * LEVERAGE
+        quantity = desired_value / price
 
         if self.step_size:
             quantity = round(quantity / self.step_size) * self.step_size
         quantity = round(quantity, 8)
         position_value = quantity * price
 
-        if self.min_notional is not None and position_value < self.min_notional:
-            print(f"[ERROR] Position value ${position_value:.2f} below minimum notional ${self.min_notional:.2f}. Cannot trade.", flush=True)
-            return {"status": "error", "message": f"Position ${position_value:.2f} below min notional ${self.min_notional:.2f}"}
+        if self.min_notional and position_value < self.min_notional:
+            print(f"[ERROR] Position ${position_value:.2f} below min notional ${self.min_notional:.2f}", flush=True)
+            return
+        if self.min_qty and quantity < self.min_qty:
+            print(f"[ERROR] Quantity {quantity} below min {self.min_qty}", flush=True)
+            return
 
-        if self.min_qty is not None and quantity < self.min_qty:
-            print(f"[ERROR] Quantity {quantity:.8f} below minimum {self.min_qty}. Cannot trade.", flush=True)
-            return {"status": "error", "message": f"Quantity {quantity:.8f} below min {self.min_qty}"}
-
-        margin_required = position_value / LEVERAGE
+        margin_req = position_value / LEVERAGE
         free_margin = self.account.free_margin
-
-        max_margin_use = free_margin * 0.98
-        max_position_value = max_margin_use * LEVERAGE
-        max_quantity = max_position_value / price
+        max_margin = free_margin * 0.98
+        max_value = max_margin * LEVERAGE
+        max_qty = max_value / price
         if self.step_size:
-            max_quantity = round(max_quantity / self.step_size) * self.step_size
-        max_quantity = round(max_quantity, 8)
-        max_position_value = max_quantity * price
+            max_qty = round(max_qty / self.step_size) * self.step_size
+        max_qty = round(max_qty, 8)
+        max_value = max_qty * price
 
-        print(f"[MARGIN DEBUG] price: {price:.2f}, target margin: ${target_margin:.2f}, desired position: ${desired_position_value:.2f}, position: ${position_value:.2f}, margin_required: ${margin_required:.2f}, free_margin: ${free_margin:.2f}, max_margin_use (98%): ${max_margin_use:.2f}", flush=True)
+        print(f"[MARGIN] price={price:.2f} equity={equity:.2f} target_margin={target_margin:.2f} position={position_value:.2f} margin_req={margin_req:.2f} free={free_margin:.2f}", flush=True)
 
-        if position_value > max_position_value:
-            print(f"[MARGIN] Reducing position from ${position_value:.2f} to ${max_position_value:.2f} (using 98% of available margin)", flush=True)
-            logging.warning(f"Reduced position from ${position_value:.2f} to ${max_position_value:.2f} to leave margin buffer")
-            quantity = max_quantity
-            position_value = max_position_value
+        if position_value > max_value:
+            print(f"[MARGIN] Reducing to ${max_value:.2f}", flush=True)
+            quantity = max_qty
+            position_value = max_value
 
         if position_value < self.min_notional or quantity < self.min_qty:
-            print(f"[ERROR] After margin adjustment, position would be below minimum. Cannot trade.", flush=True)
-            return {"status": "error", "message": "Position below minimum after margin adjustment"}
+            print(f"[ERROR] After reduction below minimum. Cannot trade.", flush=True)
+            return
 
-        print(f"[TRADE] Price: ${price:.2f} | Equity: ${equity:.2f} | Margin used: ${position_value/LEVERAGE:.2f} ({POSITION_PERCENT*100:.0f}% of equity) | Leverage: {LEVERAGE}x | Position: ${position_value:.2f} | Size: {quantity:.8f}", flush=True)
-        logging.info(f"Trade signal: {signal.value} | Price: ${price:.2f} | Equity: ${equity:.2f} | Position: ${position_value:.2f}")
+        print(f"[TRADE] {signal.value} | Price ${price:.2f} | Equity ${equity:.2f} | Margin ${position_value/LEVERAGE:.2f} | Position ${position_value:.2f} | Size {quantity:.8f}", flush=True)
 
         if signal == Signal.BULL:
-            side = SIDE_BUY
-            sl_side = SIDE_SELL
+            side, sl_side = SIDE_BUY, SIDE_SELL
             sl_price = price * (1 - SL_PERCENT)
             tp_price = price * (1 + TP_PERCENT)
         else:
-            side = SIDE_SELL
-            sl_side = SIDE_BUY
+            side, sl_side = SIDE_SELL, SIDE_BUY
             sl_price = price * (1 + SL_PERCENT)
             tp_price = price * (1 - TP_PERCENT)
 
@@ -599,27 +573,58 @@ class OilBot:
             sl_ok = self.place_stop_order(sl_side, quantity, sl_price)
             tp_ok = self.place_tp_order(sl_side, quantity, tp_price)
             if not sl_ok or not tp_ok:
-                print("[WARN] Algo SL/TP failed, starting manual monitor.")
+                print("[WARN] Algo SL/TP failed — manual monitor starting.", flush=True)
                 self.stop_monitoring = False
                 if self.monitor_thread is None or not self.monitor_thread.is_alive():
                     self.monitor_thread = threading.Thread(target=self.monitor_position, daemon=True)
                     self.monitor_thread.start()
             self.account.open_position("BUY" if side == SIDE_BUY else "SELL", quantity, price)
             self.last_trade_time = time.time()
-            return {"status": "executed", "signal": signal.value, "price": price, "quantity": quantity, "position_value": position_value}
-        else:
-            return {"status": "order_failed"}
+
+    def monitor_position(self):
+        print("[MONITOR] Manual SL/TP thread started.", flush=True)
+        while not self.stop_monitoring:
+            if self.account.position == 0:
+                break
+            price = self.fetch_price()
+            if price is None:
+                time.sleep(0.5)
+                continue
+            self.account.update_price(price)
+            if self.account.position > 0:
+                if price <= self.sl_price:
+                    print(f"[SL HIT] Long at ${price:.2f}", flush=True)
+                    self.place_market_order(SIDE_SELL, abs(self.account.position))
+                    self.account.close_position(price)
+                    break
+                elif price >= self.tp_price:
+                    print(f"[TP HIT] Long at ${price:.2f}", flush=True)
+                    self.place_market_order(SIDE_SELL, abs(self.account.position))
+                    self.account.close_position(price)
+                    break
+            elif self.account.position < 0:
+                if price >= self.sl_price:
+                    print(f"[SL HIT] Short at ${price:.2f}", flush=True)
+                    self.place_market_order(SIDE_BUY, abs(self.account.position))
+                    self.account.close_position(price)
+                    break
+                elif price <= self.tp_price:
+                    print(f"[TP HIT] Short at ${price:.2f}", flush=True)
+                    self.place_market_order(SIDE_BUY, abs(self.account.position))
+                    self.account.close_position(price)
+                    break
+            time.sleep(0.5)
+        print("[MONITOR] Thread ended.", flush=True)
 
     def run(self):
         self.init_binance()
         self.init_twitter_monitor()
-        print("[START] LIVE BOT is ready. Monitoring Twitter and waiting for signals.", flush=True)
-        logging.info("=== LIVE BOT STARTED (TWITTER + MANUAL MODE) ===")
+        print("[START] LIVE BOT READY — monitoring Twitter for BZUSDT signals.", flush=True)
         while True:
             time.sleep(60)
 
 
-# ==================== HEALTH + MANUAL TEST SERVER ====================
+# ==================== HEALTH SERVER ====================
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
 
@@ -637,40 +642,27 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == '/test':
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
+            length = int(self.headers['Content-Length'])
+            data = self.rfile.read(length)
             try:
-                data = json.loads(post_data)
-                news = data.get('news', '')
+                payload = json.loads(data)
+                news = payload.get('news', '')
             except:
                 self.send_response(400)
                 self.end_headers()
                 self.wfile.write(b'Invalid JSON')
                 return
-
             if not news:
                 self.send_response(400)
                 self.end_headers()
-                self.wfile.write(b'Missing "news" field')
+                self.wfile.write(b'Missing "news"')
                 return
-
             signal = get_sentiment(news, conflict_mode=CONFLICT_MODE)
-            print(f"\n[MANUAL TEST] News: {news}")
-            print(f"[SENTIMENT] {signal.value}")
-
-            if signal == Signal.NEUTRAL:
-                result = {"status": "neutral", "signal": "NEUTRAL"}
-            else:
-                if bot is None:
-                    result = {"status": "error", "message": "Bot not initialized yet"}
-                else:
-                    trade_result = bot.execute_trade(signal)
-                    result = {
-                        "status": "trade_attempted",
-                        "signal": signal.value,
-                        "trade_result": trade_result
-                    }
-
+            print(f"\n[MANUAL TEST] {news}", flush=True)
+            print(f"[SENTIMENT] {signal.value}", flush=True)
+            if signal != Signal.NEUTRAL and bot:
+                bot.execute_trade(signal)
+            result = {"signal": signal.value}
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
@@ -679,17 +671,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-def run_health_server():
+def run_health():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), RequestHandler)
-    print(f"Health & test server running on port {port}")
+    print(f"Health server on port {port}", flush=True)
     server.serve_forever()
 
 if __name__ == "__main__":
     bot = OilBot()
     bot.init_binance()
-
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
-
+    threading.Thread(target=run_health, daemon=True).start()
     bot.run()
