@@ -9,7 +9,7 @@ import requests
 from binance.client import Client as BinanceClient
 from binance.enums import *
 from binance.exceptions import BinanceAPIException
-from binance.streams import ThreadedWebsocketManager
+from binance import ThreadedWebsocketManager
 from dotenv import load_dotenv
 from sentiment import get_sentiment, Signal
 from twitter_monitor import TwitterMonitor
