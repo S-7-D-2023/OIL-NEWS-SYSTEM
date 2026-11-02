@@ -7,6 +7,8 @@ import json
 import logging
 import sys
 import re
+import asyncio
+import threading
 from datetime import datetime
 import requests
 from binance.client import Client as BinanceClient
@@ -21,9 +23,8 @@ sys.stdout.reconfigure(line_buffering=True)
 load_dotenv()
 
 # ==================== DEBUG ====================
-print(f"[DEBUG] TWITTER_AUTH_TOKEN exists: {bool(os.getenv('TWITTER_AUTH_TOKEN'))}", flush=True)
-print(f"[DEBUG] TWITTER_CT0 exists: {bool(os.getenv('TWITTER_CT0'))}", flush=True)
 print(f"[DEBUG] TWITTER_TARGET_USER: {os.getenv('TWITTER_TARGET_USER')}", flush=True)
+print(f"[DEBUG] TWITTER_CT0 exists: {bool(os.getenv('TWITTER_CT0'))}", flush=True)
 
 # ==================== CONFIG ====================
 SYMBOL = os.getenv("SYMBOL", "BZUSDT")
@@ -32,14 +33,14 @@ FALLBACK_SYMBOL = os.getenv("FALLBACK_SYMBOL", "BZUSDT")
 ENV_LEVERAGE = int(os.getenv("LEVERAGE", "20"))
 LEVERAGE = 20 if ENV_LEVERAGE == 10 else ENV_LEVERAGE
 if ENV_LEVERAGE == 10:
-    print("⚠️  WARNING: LEVERAGE env is 10, but we force 20x for your strategy.", flush=True)
+    print("⚠️  LEVERAGE env is 10 — forcing 20x.", flush=True)
 
 POSITION_PERCENT = float(os.getenv("POSITION_PERCENT", "0.5"))
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100.0"))
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "5.0"))   # fallback during ban
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
@@ -50,12 +51,12 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO,
 
 
 def parse_ban_until_ms(exc):
-    msg = str(exc)
-    m = re.search(r'banned until (\d{13})', msg)
+    m = re.search(r'banned until (\d{13})', str(exc))
     return int(m.group(1)) if m else None
 
 
-def safe_binance_call(func, *args, max_wait_sec=3600, **kwargs):
+def safe_binance_call(func, *args, max_wait_sec=10, **kwargs):
+    """Call Binance. On -1003, wait only if the ban is very short. Otherwise raise."""
     try:
         return func(*args, **kwargs)
     except BinanceAPIException as e:
@@ -63,15 +64,13 @@ def safe_binance_call(func, *args, max_wait_sec=3600, **kwargs):
             ban_until_ms = parse_ban_until_ms(e)
             now_ms = int(time.time() * 1000)
             if ban_until_ms:
-                wait_sec = max(5, (ban_until_ms - now_ms) // 1000 + 5)
+                wait_sec = max(1, (ban_until_ms - now_ms) // 1000 + 1)
                 if wait_sec <= max_wait_sec:
-                    print(f"[BAN] IP banned. Waiting {wait_sec}s...", flush=True)
+                    print(f"[BAN] Short ban — waiting {wait_sec}s...", flush=True)
                     time.sleep(wait_sec)
                     return func(*args, **kwargs)
-                raise RuntimeError(f"IP ban lasts {wait_sec}s") from e
-            print("[BAN] IP banned (no timestamp). Waiting 120s...", flush=True)
-            time.sleep(120)
-            return func(*args, **kwargs)
+                raise RuntimeError(f"IP ban lasts {wait_sec}s — skipping call") from e
+            raise RuntimeError("IP banned (no timestamp) — skipping call") from e
         raise
 
 
@@ -111,24 +110,11 @@ class FuturesAccount:
         self.cash = real_balance
         self.initial_balance = real_balance
 
-    def sync_position(self, pos_info):
-        for pos in pos_info:
-            if pos['symbol'] == self.active_symbol:
-                amount = float(pos['positionAmt'])
-                if amount != 0:
-                    self.position = amount
-                    self.entry_price = float(pos['entryPrice'])
-                    self.margin_used = float(pos.get('isolatedMargin', 0))
-                    return
-        self.position = 0.0
-        self.entry_price = None
-        self.margin_used = 0.0
-
     def open_position(self, side, amount, price):
         position_value = amount * price
         margin_req = position_value / self.leverage
         if not self.can_open(margin_req):
-            print(f"[ERROR] Not enough free margin.", flush=True)
+            print("[ERROR] Not enough free margin.", flush=True)
             return None
         self.cash -= margin_req
         self.margin_used += margin_req
@@ -196,7 +182,7 @@ class OilBot:
         self.step_size = None
         self.min_notional = None
 
-        # ---- WEBSOCKET PRICE FEED ----
+        # ---- WEBSOCKET ----
         self._ws_price = None
         self._ws_manager = None
         self._ws_stream_key = None
@@ -205,15 +191,23 @@ class OilBot:
         self.twitter_target = os.getenv("TWITTER_TARGET_USER")
         self.twitter_auth = os.getenv("TWITTER_AUTH_TOKEN") or os.getenv("TWITTER_AUTH_TOKEN_1")
         self.twitter_ct0 = os.getenv("TWITTER_CT0")
-        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))
-        print(f"[DEBUG] twitter_ct0 exists: {bool(self.twitter_ct0)}", flush=True)
+        self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "20"))
 
+    # ---------- WEBSOCKET (maintainer fix: explicit _loop assignment) ----------
     def start_ws_price_stream(self):
         try:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            nest_asyncio.apply(loop)
+
             self._ws_manager = ThreadedWebsocketManager(
                 api_key=BINANCE_API_KEY,
                 api_secret=BINANCE_SECRET
             )
+            self._ws_manager._loop = loop          # ← THE FIX
             self._ws_manager.start()
 
             def handle_mark_price(msg):
@@ -229,78 +223,73 @@ class OilBot:
             )
             print(f"[WS] Mark price stream started for {self.active_symbol}", flush=True)
         except Exception as e:
-            print(f"[WARN] WebSocket start failed: {e} — REST fallback remains active", flush=True)
+            print(f"[WARN] WebSocket start failed: {e}", flush=True)
             self._ws_manager = None
 
-    def init_binance(self):
+    # ---------- REST INIT (non-blocking, fallback-safe) ----------
+    def init_binance_rest(self):
+        """REST calls with fallbacks. Never sleeps for hours on a ban."""
         try:
             self.client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET)
-            self.start_ws_price_stream()
 
-            # GUARD: if WebSocket failed, exit before any REST call
-            if self._ws_manager is None:
-                print("[CRITICAL] WebSocket failed to start. Exiting without REST calls to avoid IP ban.", flush=True)
-                exit(1)
-
-            info = safe_binance_call(self.client.futures_exchange_info)
-            symbols = [s['symbol'] for s in info['symbols']]
-            print(f"[DIAG] Live Futures OK. Symbols: {len(symbols)}", flush=True)
-
-            if self.active_symbol not in symbols:
-                print(f"[WARN] {self.active_symbol} not found. Trying fallback {FALLBACK_SYMBOL}...", flush=True)
-                if FALLBACK_SYMBOL not in symbols:
-                    print(f"[CRITICAL] Neither symbol found. Exiting.", flush=True)
-                    exit(1)
-                self.active_symbol = FALLBACK_SYMBOL
-
-            for s in info['symbols']:
-                if s['symbol'] == self.active_symbol:
-                    for f in s['filters']:
-                        if f['filterType'] == 'LOT_SIZE':
-                            self.step_size = float(f['stepSize'])
-                            self.min_qty = float(f['minQty'])
-                        elif f['filterType'] == 'MIN_NOTIONAL':
-                            self.min_notional = float(f['notional'])
-                    break
+            # 1. Filters
+            try:
+                info = safe_binance_call(self.client.futures_exchange_info)
+                symbols = [s['symbol'] for s in info['symbols']]
+                if self.active_symbol not in symbols and FALLBACK_SYMBOL in symbols:
+                    self.active_symbol = FALLBACK_SYMBOL
+                for s in info['symbols']:
+                    if s['symbol'] == self.active_symbol:
+                        for f in s['filters']:
+                            if f['filterType'] == 'LOT_SIZE':
+                                self.step_size = float(f['stepSize'])
+                                self.min_qty = float(f['minQty'])
+                            elif f['filterType'] == 'MIN_NOTIONAL':
+                                self.min_notional = float(f['notional'])
+                        break
+                print(f"[DIAG] Live Futures OK. Symbols: {len(symbols)}", flush=True)
+            except Exception as e:
+                print(f"[WARN] Exchange info failed ({e}) — using BZUSDT fallback filters.", flush=True)
 
             if self.min_qty is None:
                 self.min_qty = 0.01
                 self.step_size = 0.01
                 self.min_notional = 5.0
-
             print(f"[DIAG] Filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
 
-            account = safe_binance_call(self.client.futures_account)
-            total_balance = float(account.get('totalWalletBalance', 0))
-            print(f"[DIAG] Wallet Balance: ${total_balance:.2f}", flush=True)
-            self.account.set_balance(total_balance)
+            # 2. Balance
+            try:
+                account = safe_binance_call(self.client.futures_account)
+                bal = float(account.get('totalWalletBalance', 0))
+                self.account.set_balance(bal)
+                print(f"[DIAG] Wallet Balance: ${bal:.2f}", flush=True)
+            except Exception as e:
+                print(f"[WARN] Account fetch failed ({e}) — using INITIAL_CAPITAL=${INITIAL_CAPITAL:.2f}.", flush=True)
 
+            # 3. Leverage
             try:
                 safe_binance_call(self.client.futures_change_leverage,
                                   symbol=self.active_symbol, leverage=LEVERAGE)
                 print(f"[INIT] Leverage set to {LEVERAGE}x", flush=True)
             except Exception as e:
-                print(f"[WARN] Leverage setting: {e}", flush=True)
+                print(f"[WARN] Leverage skipped: {e}", flush=True)
 
-            for attempt in range(3):
-                try:
-                    safe_binance_call(self.client.futures_change_margin_type,
-                                      symbol=self.active_symbol, marginType='ISOLATED')
-                    print(f"[INIT] Margin type ISOLATED", flush=True)
-                    break
-                except Exception as e:
-                    if "No need to change margin type" in str(e):
-                        print(f"[INIT] Margin type already ISOLATED", flush=True)
-                        break
-                    print(f"[WARN] Margin type attempt {attempt+1}: {e}", flush=True)
-                    time.sleep(1)
+            # 4. Margin type
+            try:
+                safe_binance_call(self.client.futures_change_margin_type,
+                                  symbol=self.active_symbol, marginType='ISOLATED')
+                print("[INIT] Margin type ISOLATED", flush=True)
+            except Exception as e:
+                if "No need to change margin type" in str(e):
+                    print("[INIT] Margin type already ISOLATED", flush=True)
+                else:
+                    print(f"[WARN] Margin type skipped: {e}", flush=True)
 
-            print(f"[INIT] Connected to LIVE Futures. Symbol: {self.active_symbol}", flush=True)
-
+            print(f"[INIT] REST init complete. Symbol: {self.active_symbol}", flush=True)
         except Exception as e:
-            print(f"[ERROR] Cannot connect to Live Futures: {e}", flush=True)
-            exit(1)
+            print(f"[ERROR] REST init failed: {e}", flush=True)
 
+    # ---------- PRICE ----------
     def fetch_price(self):
         if self._ws_price is not None and self._ws_price > 0:
             return self._ws_price
@@ -308,7 +297,7 @@ class OilBot:
         now = time.time()
         if self._price_cache and (now - self._price_cache_time) < self._price_cache_ttl:
             return self._price_cache
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 ticker = self.client.futures_symbol_ticker(symbol=self.active_symbol)
                 price = float(ticker['price'])
@@ -317,23 +306,16 @@ class OilBot:
                 return price
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    ban_until = parse_ban_until_ms(e)
-                    if ban_until:
-                        wait = max(5, (ban_until - int(time.time() * 1000)) // 1000 + 5)
-                        print(f"[BAN] Price fetch banned. Waiting {wait}s...", flush=True)
-                        time.sleep(wait)
-                elif attempt < 2:
+                    print("[BAN] Price REST banned — using last WS price if available.", flush=True)
+                    break
+                if attempt < 1:
                     time.sleep(0.5)
-                else:
-                    print(f"[ERROR] Price fetch failed: {e}", flush=True)
-                    return None
             except Exception:
-                if attempt < 2:
+                if attempt < 1:
                     time.sleep(0.5)
-                else:
-                    return None
-        return None
+        return self._price_cache
 
+    # ---------- ORDERS ----------
     def place_market_order(self, side, quantity):
         if self.step_size:
             quantity = round(quantity / self.step_size) * self.step_size
@@ -347,17 +329,15 @@ class OilBot:
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    ban_until = parse_ban_until_ms(e)
-                    if ban_until:
-                        wait = max(5, (ban_until - int(time.time() * 1000)) // 1000 + 5)
-                        print(f"[BAN] Order banned. Waiting {wait}s...", flush=True)
-                        time.sleep(wait)
-                elif attempt < 2:
+                    print("[BAN] Market order banned.", flush=True)
+                    return None
+                print(f"[MARKET ORDER ERROR] {attempt+1}: {e}", flush=True)
+                if attempt < 2:
                     time.sleep(0.5)
                 else:
-                    print(f"[MARKET ORDER ERROR] {e}", flush=True)
                     return None
-            except Exception:
+            except Exception as e:
+                print(f"[MARKET ORDER ERROR] {attempt+1}: {e}", flush=True)
                 if attempt < 2:
                     time.sleep(0.5)
                 else:
@@ -383,16 +363,15 @@ class OilBot:
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    ban_until = parse_ban_until_ms(e)
-                    if ban_until:
-                        wait = max(5, (ban_until - int(time.time() * 1000)) // 1000 + 5)
-                        time.sleep(wait)
-                elif attempt < 2:
+                    print("[BAN] Stop order banned.", flush=True)
+                    return None
+                print(f"[STOP ORDER ERROR] {attempt+1}: {e}", flush=True)
+                if attempt < 2:
                     time.sleep(0.5)
                 else:
-                    print(f"[STOP ORDER ERROR] {e}", flush=True)
                     return None
-            except Exception:
+            except Exception as e:
+                print(f"[STOP ORDER ERROR] {attempt+1}: {e}", flush=True)
                 if attempt < 2:
                     time.sleep(0.5)
                 else:
@@ -418,16 +397,15 @@ class OilBot:
                 return order
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    ban_until = parse_ban_until_ms(e)
-                    if ban_until:
-                        wait = max(5, (ban_until - int(time.time() * 1000)) // 1000 + 5)
-                        time.sleep(wait)
-                elif attempt < 2:
+                    print("[BAN] TP order banned.", flush=True)
+                    return None
+                print(f"[TP ORDER ERROR] {attempt+1}: {e}", flush=True)
+                if attempt < 2:
                     time.sleep(0.5)
                 else:
-                    print(f"[TP ORDER ERROR] {e}", flush=True)
                     return None
-            except Exception:
+            except Exception as e:
+                print(f"[TP ORDER ERROR] {attempt+1}: {e}", flush=True)
                 if attempt < 2:
                     time.sleep(0.5)
                 else:
@@ -449,8 +427,9 @@ class OilBot:
             self.account.entry_price = None
             self.account.margin_used = 0.0
         except Exception as e:
-            print(f"[WARN] Could not sync position: {e}", flush=True)
+            print(f"[WARN] Position sync skipped (ban or error): {e}", flush=True)
 
+    # ---------- TWITTER ----------
     def init_twitter_monitor(self):
         if not self.twitter_target or not self.twitter_auth or not self.twitter_ct0:
             print("[TWITTER] Credentials missing. Monitor disabled.", flush=True)
@@ -476,10 +455,11 @@ class OilBot:
         else:
             print("[TWITTER] Failed to start.", flush=True)
 
+    # ---------- TRADE ----------
     def execute_trade(self, signal):
         now = time.time()
         if now - self.last_trade_time < COOLDOWN_SECONDS:
-            print(f"[COOLDOWN]", flush=True)
+            print("[COOLDOWN]", flush=True)
             return
 
         self.sync_position_from_exchange()
@@ -489,6 +469,7 @@ class OilBot:
 
         price = self.fetch_price()
         if price is None:
+            print("[ERROR] No price available (WS not ready, REST banned).", flush=True)
             return
 
         self.account.update_price(price)
@@ -527,7 +508,7 @@ class OilBot:
             position_value = max_value
 
         if position_value < self.min_notional or quantity < self.min_qty:
-            print(f"[ERROR] After reduction below minimum. Cannot trade.", flush=True)
+            print("[ERROR] After reduction below minimum. Cannot trade.", flush=True)
             return
 
         print(f"[TRADE] {signal.value} | Price ${price:.2f} | Equity ${equity:.2f} | Margin ${position_value/LEVERAGE:.2f} | Position ${position_value:.2f} | Size {quantity:.8f}", flush=True)
@@ -591,17 +572,9 @@ class OilBot:
             time.sleep(0.5)
         print("[MONITOR] Thread ended.", flush=True)
 
-    def run(self):
-        self.init_binance()
-        self.init_twitter_monitor()
-        print("[START] LIVE BOT READY — monitoring Twitter for BZUSDT signals.", flush=True)
-        while True:
-            time.sleep(60)
-
 
 # ==================== HEALTH SERVER ====================
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 
 bot = None
 
@@ -637,11 +610,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             print(f"[SENTIMENT] {signal.value}", flush=True)
             if signal != Signal.NEUTRAL and bot:
                 bot.execute_trade(signal)
-            result = {"signal": signal.value}
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps(result).encode())
+            self.wfile.write(json.dumps({"signal": signal.value}).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -652,8 +624,25 @@ def run_health():
     print(f"Health server on port {port}", flush=True)
     server.serve_forever()
 
+
+# ==================== STARTUP ====================
 if __name__ == "__main__":
-    bot = OilBot()
-    bot.init_binance()
+    # 1. Health server FIRST — Render health check passes immediately
     threading.Thread(target=run_health, daemon=True).start()
-    bot.run()
+    print("[START] Health server started.", flush=True)
+
+    # 2. Create bot
+    bot = OilBot()
+
+    # 3. WebSocket price stream — no REST, works during ban
+    bot.start_ws_price_stream()
+
+    # 4. REST init in background — never blocks health or Twitter
+    threading.Thread(target=bot.init_binance_rest, daemon=True).start()
+
+    # 5. Twitter monitor
+    bot.init_twitter_monitor()
+
+    # 6. Keep alive
+    while True:
+        time.sleep(60)
