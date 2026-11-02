@@ -9,6 +9,8 @@ import sys
 import re
 import asyncio
 import threading
+import hmac
+import hashlib
 from datetime import datetime
 import requests
 from binance.client import Client as BinanceClient
@@ -22,7 +24,6 @@ from twitter_monitor import TwitterMonitor
 sys.stdout.reconfigure(line_buffering=True)
 load_dotenv()
 
-# ==================== DEBUG ====================
 print(f"[DEBUG] TWITTER_TARGET_USER: {os.getenv('TWITTER_TARGET_USER')}", flush=True)
 print(f"[DEBUG] TWITTER_CT0 exists: {bool(os.getenv('TWITTER_CT0'))}", flush=True)
 
@@ -40,7 +41,7 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "5.0"))   # fallback during ban
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "5.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
@@ -56,7 +57,6 @@ def parse_ban_until_ms(exc):
 
 
 def safe_binance_call(func, *args, max_wait_sec=10, **kwargs):
-    """Call Binance. On -1003, wait only if the ban is very short. Otherwise raise."""
     try:
         return func(*args, **kwargs)
     except BinanceAPIException as e:
@@ -182,7 +182,6 @@ class OilBot:
         self.step_size = None
         self.min_notional = None
 
-        # ---- WEBSOCKET ----
         self._ws_price = None
         self._ws_manager = None
         self._ws_stream_key = None
@@ -193,7 +192,7 @@ class OilBot:
         self.twitter_ct0 = os.getenv("TWITTER_CT0")
         self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "20"))
 
-    # ---------- WEBSOCKET (maintainer fix: explicit _loop assignment) ----------
+    # ---------- WEBSOCKET ----------
     def start_ws_price_stream(self):
         try:
             try:
@@ -207,7 +206,7 @@ class OilBot:
                 api_key=BINANCE_API_KEY,
                 api_secret=BINANCE_SECRET
             )
-            self._ws_manager._loop = loop          # ← THE FIX
+            self._ws_manager._loop = loop
             self._ws_manager.start()
 
             def handle_mark_price(msg):
@@ -226,13 +225,59 @@ class OilBot:
             print(f"[WARN] WebSocket start failed: {e}", flush=True)
             self._ws_manager = None
 
-    # ---------- REST INIT (non-blocking, fallback-safe) ----------
+    # ---------- ALGO ORDER CLEANUP (pre-trade, best-effort) ----------
+    def cancel_orphaned_algo_orders(self):
+        """Cancel all open algo orders for the symbol before opening a new trade.
+        Returns True if cleanup succeeded, False otherwise.
+        The caller does NOT abort on False — the trade proceeds regardless."""
+        try:
+            timestamp = int(time.time() * 1000)
+            qs = f"symbol={self.active_symbol}&timestamp={timestamp}"
+            sig = hmac.new(BINANCE_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
+
+            r = requests.get(
+                f"https://fapi.binance.com/fapi/v1/openAlgoOrders?{qs}&signature={sig}",
+                headers={"X-MBX-APIKEY": BINANCE_API_KEY},
+                timeout=10
+            )
+            if r.status_code != 200:
+                print(f"[CLEANUP] List failed: HTTP {r.status_code}", flush=True)
+                return False
+
+            data = r.json()
+            orders = data.get('orders', []) if isinstance(data, dict) else []
+            if not orders:
+                print("[CLEANUP] No orphaned algo orders.", flush=True)
+                return True
+
+            all_ok = True
+            for o in orders:
+                algo_id = o.get('algoId')
+                if not algo_id:
+                    continue
+                ts = int(time.time() * 1000)
+                qs2 = f"algoId={algo_id}&timestamp={ts}"
+                sig2 = hmac.new(BINANCE_SECRET.encode(), qs2.encode(), hashlib.sha256).hexdigest()
+                dr = requests.delete(
+                    f"https://fapi.binance.com/fapi/v1/algoOrder?{qs2}&signature={sig2}",
+                    headers={"X-MBX-APIKEY": BINANCE_API_KEY},
+                    timeout=10
+                )
+                if dr.status_code == 200:
+                    print(f"[CLEANUP] Cancelled orphaned algoId {algo_id}", flush=True)
+                else:
+                    print(f"[CLEANUP] Cancel {algo_id} failed: HTTP {dr.status_code}", flush=True)
+                    all_ok = False
+            return all_ok
+        except Exception as e:
+            print(f"[CLEANUP] Error: {e}", flush=True)
+            return False
+
+    # ---------- REST INIT (no startup cleanup) ----------
     def init_binance_rest(self):
-        """REST calls with fallbacks. Never sleeps for hours on a ban."""
         try:
             self.client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET)
 
-            # 1. Filters
             try:
                 info = safe_binance_call(self.client.futures_exchange_info)
                 symbols = [s['symbol'] for s in info['symbols']]
@@ -257,7 +302,6 @@ class OilBot:
                 self.min_notional = 5.0
             print(f"[DIAG] Filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
 
-            # 2. Balance
             try:
                 account = safe_binance_call(self.client.futures_account)
                 bal = float(account.get('totalWalletBalance', 0))
@@ -266,7 +310,6 @@ class OilBot:
             except Exception as e:
                 print(f"[WARN] Account fetch failed ({e}) — using INITIAL_CAPITAL=${INITIAL_CAPITAL:.2f}.", flush=True)
 
-            # 3. Leverage
             try:
                 safe_binance_call(self.client.futures_change_leverage,
                                   symbol=self.active_symbol, leverage=LEVERAGE)
@@ -274,7 +317,6 @@ class OilBot:
             except Exception as e:
                 print(f"[WARN] Leverage skipped: {e}", flush=True)
 
-            # 4. Margin type
             try:
                 safe_binance_call(self.client.futures_change_margin_type,
                                   symbol=self.active_symbol, marginType='ISOLATED')
@@ -306,7 +348,7 @@ class OilBot:
                 return price
             except BinanceAPIException as e:
                 if e.code == -1003:
-                    print("[BAN] Price REST banned — using last WS price if available.", flush=True)
+                    print("[BAN] Price REST banned — using last WS price.", flush=True)
                     break
                 if attempt < 1:
                     time.sleep(0.5)
@@ -427,7 +469,7 @@ class OilBot:
             self.account.entry_price = None
             self.account.margin_used = 0.0
         except Exception as e:
-            print(f"[WARN] Position sync skipped (ban or error): {e}", flush=True)
+            print(f"[WARN] Position sync skipped: {e}", flush=True)
 
     # ---------- TWITTER ----------
     def init_twitter_monitor(self):
@@ -467,9 +509,13 @@ class OilBot:
             print(f"[SKIP] Position already open. Ignoring {signal.value}.", flush=True)
             return
 
+        # PRE-TRADE CLEANUP: cancel any orphaned SL/TP from the previous trade.
+        # Best-effort — trade continues regardless of outcome.
+        self.cancel_orphaned_algo_orders()
+
         price = self.fetch_price()
         if price is None:
-            print("[ERROR] No price available (WS not ready, REST banned).", flush=True)
+            print("[ERROR] No price available.", flush=True)
             return
 
         self.account.update_price(price)
@@ -579,6 +625,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 bot = None
 
 class RequestHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        path = getattr(self, 'path', None)
+        if path in ('/health', '/'):
+            return
+        super().log_message(format, *args)
+
     def do_GET(self):
         if self.path == '/health':
             self.send_response(200)
@@ -627,22 +679,13 @@ def run_health():
 
 # ==================== STARTUP ====================
 if __name__ == "__main__":
-    # 1. Health server FIRST — Render health check passes immediately
     threading.Thread(target=run_health, daemon=True).start()
-    print("[START] Health server started.", flush=True)
+    print("[START] Health server started (/health and / silenced).", flush=True)
 
-    # 2. Create bot
     bot = OilBot()
-
-    # 3. WebSocket price stream — no REST, works during ban
     bot.start_ws_price_stream()
-
-    # 4. REST init in background — never blocks health or Twitter
     threading.Thread(target=bot.init_binance_rest, daemon=True).start()
-
-    # 5. Twitter monitor
     bot.init_twitter_monitor()
 
-    # 6. Keep alive
     while True:
         time.sleep(60)
