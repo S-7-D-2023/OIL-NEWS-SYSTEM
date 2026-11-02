@@ -1,3 +1,6 @@
+import nest_asyncio
+nest_asyncio.apply()
+
 import os
 import time
 import json
@@ -194,9 +197,9 @@ class OilBot:
         self.min_notional = None
 
         # ---- WEBSOCKET PRICE FEED ----
-        self._ws_price = None          # live price from WebSocket
-        self._ws_manager = None        # ThreadedWebsocketManager reference
-        self._ws_stream_key = None     # stream key, for clean shutdown
+        self._ws_price = None
+        self._ws_manager = None
+        self._ws_stream_key = None
 
         self.twitter_monitor = None
         self.twitter_target = os.getenv("TWITTER_TARGET_USER")
@@ -205,32 +208,7 @@ class OilBot:
         self.twitter_interval = int(os.getenv("TWITTER_POLL_INTERVAL", "10"))
         print(f"[DEBUG] twitter_ct0 exists: {bool(self.twitter_ct0)}", flush=True)
 
-    def sign_tradfi_agreement(self):
-        """One-time signing of TradFi-Perps agreement (required for BZUSDT)."""
-        import hmac, hashlib
-        try:
-            timestamp = int(time.time() * 1000)
-            params_str = f"timestamp={timestamp}"
-            signature = hmac.new(
-                BINANCE_SECRET.encode('utf-8'),
-                params_str.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-
-            url = "https://fapi.binance.com/fapi/v1/stock/contract"
-            headers = {"X-MBX-APIKEY": BINANCE_API_KEY}
-            payload = {"timestamp": timestamp, "signature": signature}
-
-            r = requests.post(url, headers=headers, params=payload, timeout=10)
-            if r.status_code == 200 and "SUCCESS" in r.text:
-                print("[INIT] TradFi-Perps agreement signed successfully.", flush=True)
-            else:
-                print(f"[WARN] TradFi agreement signing: {r.status_code} {r.text}", flush=True)
-        except Exception as e:
-            print(f"[WARN] TradFi agreement signing failed: {e}", flush=True)
-
     def start_ws_price_stream(self):
-        """Start the mark-price WebSocket. Public stream, no auth, no REST budget."""
         try:
             self._ws_manager = ThreadedWebsocketManager(
                 api_key=BINANCE_API_KEY,
@@ -239,7 +217,6 @@ class OilBot:
             self._ws_manager.start()
 
             def handle_mark_price(msg):
-                # markPriceUpdate event: 'p' = mark price
                 if isinstance(msg, dict) and msg.get('e') == 'markPriceUpdate':
                     try:
                         self._ws_price = float(msg['p'])
@@ -258,12 +235,12 @@ class OilBot:
     def init_binance(self):
         try:
             self.client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET)
-
-            # Sign TradFi agreement first (required for BZUSDT)
-            self.sign_tradfi_agreement()
-
-            # ===== START WEBSOCKET BEFORE ANY REST PRICE CALL =====
             self.start_ws_price_stream()
+
+            # GUARD: if WebSocket failed, exit before any REST call
+            if self._ws_manager is None:
+                print("[CRITICAL] WebSocket failed to start. Exiting without REST calls to avoid IP ban.", flush=True)
+                exit(1)
 
             info = safe_binance_call(self.client.futures_exchange_info)
             symbols = [s['symbol'] for s in info['symbols']]
@@ -325,11 +302,9 @@ class OilBot:
             exit(1)
 
     def fetch_price(self):
-        # ===== PRIMARY: WebSocket live mark price =====
         if self._ws_price is not None and self._ws_price > 0:
             return self._ws_price
 
-        # ===== FALLBACK: REST (only until first WebSocket tick) =====
         now = time.time()
         if self._price_cache and (now - self._price_cache_time) < self._price_cache_ttl:
             return self._price_cache
