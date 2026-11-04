@@ -41,8 +41,9 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "0"))
 SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
-INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "5.0"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
+
+# NO INITIAL_CAPITAL — the bot fetches the real balance at trade time.
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
@@ -76,15 +77,14 @@ def safe_binance_call(func, *args, max_wait_sec=10, **kwargs):
 
 # ==================== FuturesAccount ====================
 class FuturesAccount:
-    def __init__(self, initial_balance):
-        self.cash = initial_balance
+    def __init__(self):
+        self.cash = 0.0
         self.position = 0.0
         self.entry_price = None
         self.margin_used = 0.0
         self.realized_pnl = 0.0
         self.leverage = LEVERAGE
         self.current_price = 0.0
-        self.initial_balance = initial_balance
         self.active_symbol = SYMBOL
 
     @property
@@ -106,9 +106,9 @@ class FuturesAccount:
     def can_open(self, margin_required):
         return self.free_margin >= margin_required
 
-    def set_balance(self, real_balance):
+    def set_real_balance(self, real_balance):
         self.cash = real_balance
-        self.initial_balance = real_balance
+        print(f"[ACCOUNT] Real balance locked: ${real_balance:.2f}", flush=True)
 
     def open_position(self, side, amount, price):
         position_value = amount * price
@@ -166,7 +166,7 @@ class FuturesAccount:
 class OilBot:
     def __init__(self):
         self.client = None
-        self.account = FuturesAccount(INITIAL_CAPITAL)
+        self.account = FuturesAccount()
         self.last_trade_time = 0
         self.active_symbol = SYMBOL
         self.consecutive_errors = 0
@@ -225,91 +225,64 @@ class OilBot:
             print(f"[WARN] WebSocket start failed: {e}", flush=True)
             self._ws_manager = None
 
-    # ---------- ALGO ORDER CLEANUP (pre-trade, best-effort) ----------
-    def cancel_orphaned_algo_orders(self):
-        """Cancel all open algo orders for the symbol before opening a new trade.
-        Returns True if cleanup succeeded, False otherwise.
-        The caller does NOT abort on False — the trade proceeds regardless."""
-        try:
-            timestamp = int(time.time() * 1000)
-            qs = f"symbol={self.active_symbol}&timestamp={timestamp}"
-            sig = hmac.new(BINANCE_SECRET.encode(), qs.encode(), hashlib.sha256).hexdigest()
-
-            r = requests.get(
-                f"https://fapi.binance.com/fapi/v1/openAlgoOrders?{qs}&signature={sig}",
-                headers={"X-MBX-APIKEY": BINANCE_API_KEY},
-                timeout=10
-            )
-            if r.status_code != 200:
-                print(f"[CLEANUP] List failed: HTTP {r.status_code}", flush=True)
-                return False
-
-            data = r.json()
-            orders = data.get('orders', []) if isinstance(data, dict) else []
-            if not orders:
-                print("[CLEANUP] No orphaned algo orders.", flush=True)
-                return True
-
-            all_ok = True
-            for o in orders:
-                algo_id = o.get('algoId')
-                if not algo_id:
-                    continue
-                ts = int(time.time() * 1000)
-                qs2 = f"algoId={algo_id}&timestamp={ts}"
-                sig2 = hmac.new(BINANCE_SECRET.encode(), qs2.encode(), hashlib.sha256).hexdigest()
-                dr = requests.delete(
-                    f"https://fapi.binance.com/fapi/v1/algoOrder?{qs2}&signature={sig2}",
-                    headers={"X-MBX-APIKEY": BINANCE_API_KEY},
-                    timeout=10
-                )
-                if dr.status_code == 200:
-                    print(f"[CLEANUP] Cancelled orphaned algoId {algo_id}", flush=True)
+    # ---------- REAL BALANCE FETCH (AT TRADE TIME) ----------
+    def fetch_real_balance(self):
+        """Fetch real balance from Binance. Returns float or None. No fake fallback."""
+        for attempt in range(3):
+            try:
+                account = self.client.futures_account()
+                balance = float(account.get('totalWalletBalance', 0))
+                if balance > 0:
+                    return balance
                 else:
-                    print(f"[CLEANUP] Cancel {algo_id} failed: HTTP {dr.status_code}", flush=True)
-                    all_ok = False
-            return all_ok
-        except Exception as e:
-            print(f"[CLEANUP] Error: {e}", flush=True)
-            return False
+                    print(f"[WARN] Balance returned ${balance:.2f} — retrying...", flush=True)
+            except BinanceAPIException as e:
+                if e.code == -1003:
+                    print("[BAN] Balance fetch banned — trade aborted (order would be banned too).", flush=True)
+                    return None
+                print(f"[WARN] Balance fetch attempt {attempt+1}: {e}", flush=True)
+            except Exception as e:
+                print(f"[WARN] Balance fetch attempt {attempt+1}: {e}", flush=True)
+            if attempt < 2:
+                time.sleep(2)
+        return None
 
-    # ---------- REST INIT (no startup cleanup) ----------
+    # ---------- REST INIT (NO BALANCE FETCH) ----------
     def init_binance_rest(self):
         try:
             self.client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET)
 
-            try:
-                info = safe_binance_call(self.client.futures_exchange_info)
-                symbols = [s['symbol'] for s in info['symbols']]
-                if self.active_symbol not in symbols and FALLBACK_SYMBOL in symbols:
-                    self.active_symbol = FALLBACK_SYMBOL
-                for s in info['symbols']:
-                    if s['symbol'] == self.active_symbol:
-                        for f in s['filters']:
-                            if f['filterType'] == 'LOT_SIZE':
-                                self.step_size = float(f['stepSize'])
-                                self.min_qty = float(f['minQty'])
-                            elif f['filterType'] == 'MIN_NOTIONAL':
-                                self.min_notional = float(f['notional'])
-                        break
-                print(f"[DIAG] Live Futures OK. Symbols: {len(symbols)}", flush=True)
-            except Exception as e:
-                print(f"[WARN] Exchange info failed ({e}) — using BZUSDT fallback filters.", flush=True)
+            # Only fetch symbol filters at startup
+            for attempt in range(5):
+                try:
+                    info = safe_binance_call(self.client.futures_exchange_info)
+                    symbols = [s['symbol'] for s in info['symbols']]
+                    if self.active_symbol not in symbols and FALLBACK_SYMBOL in symbols:
+                        self.active_symbol = FALLBACK_SYMBOL
+                    for s in info['symbols']:
+                        if s['symbol'] == self.active_symbol:
+                            for f in s['filters']:
+                                if f['filterType'] == 'LOT_SIZE':
+                                    self.step_size = float(f['stepSize'])
+                                    self.min_qty = float(f['minQty'])
+                                elif f['filterType'] == 'MIN_NOTIONAL':
+                                    self.min_notional = float(f['notional'])
+                            break
+                    print(f"[DIAG] Live Futures OK. Symbols: {len(symbols)}", flush=True)
+                    break
+                except Exception as e:
+                    print(f"[WARN] Exchange info attempt {attempt+1} failed: {e}", flush=True)
+                    time.sleep(5)
 
             if self.min_qty is None:
+                print("[WARN] Filters not fetched — using BZUSDT fallback values.", flush=True)
                 self.min_qty = 0.01
                 self.step_size = 0.01
                 self.min_notional = 5.0
+
             print(f"[DIAG] Filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
 
-            try:
-                account = safe_binance_call(self.client.futures_account)
-                bal = float(account.get('totalWalletBalance', 0))
-                self.account.set_balance(bal)
-                print(f"[DIAG] Wallet Balance: ${bal:.2f}", flush=True)
-            except Exception as e:
-                print(f"[WARN] Account fetch failed ({e}) — using INITIAL_CAPITAL=${INITIAL_CAPITAL:.2f}.", flush=True)
-
+            # Leverage
             try:
                 safe_binance_call(self.client.futures_change_leverage,
                                   symbol=self.active_symbol, leverage=LEVERAGE)
@@ -317,6 +290,7 @@ class OilBot:
             except Exception as e:
                 print(f"[WARN] Leverage skipped: {e}", flush=True)
 
+            # Margin type
             try:
                 safe_binance_call(self.client.futures_change_margin_type,
                                   symbol=self.active_symbol, marginType='ISOLATED')
@@ -328,6 +302,7 @@ class OilBot:
                     print(f"[WARN] Margin type skipped: {e}", flush=True)
 
             print(f"[INIT] REST init complete. Symbol: {self.active_symbol}", flush=True)
+
         except Exception as e:
             print(f"[ERROR] REST init failed: {e}", flush=True)
 
@@ -509,9 +484,12 @@ class OilBot:
             print(f"[SKIP] Position already open. Ignoring {signal.value}.", flush=True)
             return
 
-        # PRE-TRADE CLEANUP: cancel any orphaned SL/TP from the previous trade.
-        # Best-effort — trade continues regardless of outcome.
-        self.cancel_orphaned_algo_orders()
+        # FETCH REAL BALANCE NOW — no fake number, no startup cache
+        balance = self.fetch_real_balance()
+        if balance is None:
+            print("[SKIP] Real balance unavailable — trade aborted to avoid fake sizing.", flush=True)
+            return
+        self.account.set_real_balance(balance)
 
         price = self.fetch_price()
         if price is None:
@@ -680,7 +658,7 @@ def run_health():
 # ==================== STARTUP ====================
 if __name__ == "__main__":
     threading.Thread(target=run_health, daemon=True).start()
-    print("[START] Health server started (/health and / silenced).", flush=True)
+    print("[START] Health server started.", flush=True)
 
     bot = OilBot()
     bot.start_ws_price_stream()
