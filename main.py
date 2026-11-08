@@ -20,12 +20,14 @@ from binance import ThreadedWebsocketManager
 from dotenv import load_dotenv
 from sentiment import get_sentiment, Signal
 from twitter_monitor import TwitterMonitor
+from groq_brain import classify_headline
 
 sys.stdout.reconfigure(line_buffering=True)
 load_dotenv()
 
 print(f"[DEBUG] TWITTER_TARGET_USER: {os.getenv('TWITTER_TARGET_USER')}", flush=True)
 print(f"[DEBUG] TWITTER_CT0 exists: {bool(os.getenv('TWITTER_CT0'))}", flush=True)
+print(f"[DEBUG] GROQ_API_KEY exists: {bool(os.getenv('GROQ_API_KEY'))}", flush=True)
 
 # ==================== CONFIG ====================
 SYMBOL = os.getenv("SYMBOL", "BZUSDT")
@@ -42,8 +44,6 @@ SL_PERCENT = float(os.getenv("SL_PERCENT", "0.10"))
 TP_PERCENT = float(os.getenv("TP_PERCENT", "0.10"))
 FEE_RATE = float(os.getenv("FEE_RATE", "0.0004"))
 CONFLICT_MODE = os.getenv("CONFLICT_MODE", "BEAR_BIAS")
-
-# NO INITIAL_CAPITAL — the bot fetches the real balance at trade time.
 
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET")
@@ -227,7 +227,6 @@ class OilBot:
 
     # ---------- REAL BALANCE FETCH (AT TRADE TIME) ----------
     def fetch_real_balance(self):
-        """Fetch real balance from Binance. Returns float or None. No fake fallback."""
         for attempt in range(3):
             try:
                 account = self.client.futures_account()
@@ -252,7 +251,6 @@ class OilBot:
         try:
             self.client = BinanceClient(BINANCE_API_KEY, BINANCE_SECRET)
 
-            # Only fetch symbol filters at startup
             for attempt in range(5):
                 try:
                     info = safe_binance_call(self.client.futures_exchange_info)
@@ -282,7 +280,6 @@ class OilBot:
 
             print(f"[DIAG] Filters: minQty={self.min_qty}, stepSize={self.step_size}, minNotional={self.min_notional}", flush=True)
 
-            # Leverage
             try:
                 safe_binance_call(self.client.futures_change_leverage,
                                   symbol=self.active_symbol, leverage=LEVERAGE)
@@ -290,7 +287,6 @@ class OilBot:
             except Exception as e:
                 print(f"[WARN] Leverage skipped: {e}", flush=True)
 
-            # Margin type
             try:
                 safe_binance_call(self.client.futures_change_margin_type,
                                   symbol=self.active_symbol, marginType='ISOLATED')
@@ -460,12 +456,33 @@ class OilBot:
         def on_new_tweet(tweet):
             text = tweet.get('text', '')
             print(f"\n[TWITTER] NEW TWEET: {text[:120]}...", flush=True)
+
+            # ========== GROQ BRAIN (primary) ==========
+            result = classify_headline(text)
+
+            if result is not None:
+                sig_str = result['signal']
+                strength = result['strength']
+                conf = result['confidence']
+
+                if sig_str == 'NEUTRAL':
+                    print(f"[GROQ] NEUTRAL (conf={conf:.2f}) — no trade.", flush=True)
+                    return
+
+                signal = Signal.BULL if sig_str == 'BULL' else Signal.BEAR
+                tp_multiplier = float(strength)   # 1, 2, or 3
+                print(f"[GROQ] {sig_str} | strength={strength} | conf={conf:.2f} | TP×{tp_multiplier:.0f} | SL unchanged", flush=True)
+                self.execute_trade(signal, tp_multiplier=tp_multiplier)
+                return
+
+            # ========== KEYWORD FALLBACK (unchanged) ==========
+            print("[GROQ] unavailable — falling back to keyword engine (TP×1).", flush=True)
             signal = get_sentiment(text, conflict_mode=CONFLICT_MODE)
-            print(f"[SENTIMENT] {signal.value}", flush=True)
+            print(f"[SENTIMENT] {signal.value} (fallback)", flush=True)
             if signal == Signal.NEUTRAL:
                 print("[SKIP] Neutral — no trade.", flush=True)
                 return
-            self.execute_trade(signal)
+            self.execute_trade(signal, tp_multiplier=1.0)
 
         if self.twitter_monitor.start(on_new_tweet):
             print(f"[TWITTER] Monitoring @{self.twitter_target} every {self.twitter_interval}s", flush=True)
@@ -473,7 +490,7 @@ class OilBot:
             print("[TWITTER] Failed to start.", flush=True)
 
     # ---------- TRADE ----------
-    def execute_trade(self, signal):
+    def execute_trade(self, signal, tp_multiplier=1.0):
         now = time.time()
         if now - self.last_trade_time < COOLDOWN_SECONDS:
             print("[COOLDOWN]", flush=True)
@@ -484,7 +501,6 @@ class OilBot:
             print(f"[SKIP] Position already open. Ignoring {signal.value}.", flush=True)
             return
 
-        # FETCH REAL BALANCE NOW — no fake number, no startup cache
         balance = self.fetch_real_balance()
         if balance is None:
             print("[SKIP] Real balance unavailable — trade aborted to avoid fake sizing.", flush=True)
@@ -535,16 +551,19 @@ class OilBot:
             print("[ERROR] After reduction below minimum. Cannot trade.", flush=True)
             return
 
-        print(f"[TRADE] {signal.value} | Price ${price:.2f} | Equity ${equity:.2f} | Margin ${position_value/LEVERAGE:.2f} | Position ${position_value:.2f} | Size {quantity:.8f}", flush=True)
+        # SL stays SL_PERCENT. TP scales by tp_multiplier (1, 2, or 3).
+        effective_tp = TP_PERCENT * tp_multiplier
+
+        print(f"[TRADE] {signal.value} | Price ${price:.2f} | Equity ${equity:.2f} | Margin ${position_value/LEVERAGE:.2f} | Position ${position_value:.2f} | Size {quantity:.8f} | SL {SL_PERCENT*100:.1f}% | TP {effective_tp*100:.1f}%", flush=True)
 
         if signal == Signal.BULL:
             side, sl_side = SIDE_BUY, SIDE_SELL
             sl_price = price * (1 - SL_PERCENT)
-            tp_price = price * (1 + TP_PERCENT)
+            tp_price = price * (1 + effective_tp)
         else:
             side, sl_side = SIDE_SELL, SIDE_BUY
             sl_price = price * (1 + SL_PERCENT)
-            tp_price = price * (1 - TP_PERCENT)
+            tp_price = price * (1 - effective_tp)
 
         market_ok = self.place_market_order(side, quantity)
         if market_ok:
@@ -635,15 +654,34 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'Missing "news"')
                 return
-            signal = get_sentiment(news, conflict_mode=CONFLICT_MODE)
-            print(f"\n[MANUAL TEST] {news}", flush=True)
-            print(f"[SENTIMENT] {signal.value}", flush=True)
-            if signal != Signal.NEUTRAL and bot:
-                bot.execute_trade(signal)
+
+            result = classify_headline(news)
+            if result is not None:
+                sig_str = result['signal']
+                strength = result['strength']
+                conf = result['confidence']
+                if sig_str == 'NEUTRAL':
+                    print(f"\n[MANUAL TEST] {news}", flush=True)
+                    print(f"[GROQ] NEUTRAL (conf={conf:.2f}) — no trade.", flush=True)
+                else:
+                    signal = Signal.BULL if sig_str == 'BULL' else Signal.BEAR
+                    print(f"\n[MANUAL TEST] {news}", flush=True)
+                    print(f"[GROQ] {sig_str} strength={strength} conf={conf:.2f} → TP×{strength}", flush=True)
+                    if bot:
+                        bot.execute_trade(signal, tp_multiplier=float(strength))
+                body = {"source": "groq", "signal": sig_str, "strength": strength, "confidence": conf}
+            else:
+                signal = get_sentiment(news, conflict_mode=CONFLICT_MODE)
+                print(f"\n[MANUAL TEST] {news}", flush=True)
+                print(f"[SENTIMENT] {signal.value} (fallback)", flush=True)
+                if signal != Signal.NEUTRAL and bot:
+                    bot.execute_trade(signal, tp_multiplier=1.0)
+                body = {"source": "keyword", "signal": signal.value, "strength": 1}
+
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"signal": signal.value}).encode())
+            self.wfile.write(json.dumps(body).encode())
         else:
             self.send_response(404)
             self.end_headers()
