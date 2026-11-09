@@ -7,8 +7,8 @@ import requests
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# CORRECT MODEL — llama-3.1-8b-instant was retired 2026-08-16.
-# Groq's official replacement: openai/gpt-oss-20b (free tier: 30 RPM, 1000 RPD).
+# openai/gpt-oss-20b — reasoning model. Reasoning tokens count against
+# max_completion_tokens, so it must be high enough to leave room for JSON.
 GROQ_MODEL = "openai/gpt-oss-20b"
 
 _consecutive_failures = 0
@@ -39,9 +39,12 @@ def classify_headline(headline: str):
     """
     Returns dict {"signal": str, "strength": int, "confidence": float}
     or None if Groq is unavailable / failed / rate-limited.
+
+    Caller MUST treat None as 'fall back to keyword engine'.
     """
     global _consecutive_failures, _groq_disabled_until
 
+    # Circuit breaker: skip Groq entirely for 5 minutes after 3 failures
     if time.time() < _groq_disabled_until:
         return None
 
@@ -61,11 +64,18 @@ def classify_headline(headline: str):
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": f"Headline: {headline}"}
                 ],
-                "temperature": 0,
-                "max_tokens": 60,
+                # Do NOT use temperature=0 — reasoning models can loop.
+                # 0.2 keeps output stable without freezing the reasoning path.
+                "temperature": 0.2,
+                # Reasoning tokens count against this budget.
+                # 60 was the old bug — it truncated the JSON.
+                "max_completion_tokens": 1024,
+                # Minimise chain-of-thought for a simple classification task.
+                "reasoning_effort": "low",
+                # JSON Object Mode — prompt already contains the word "JSON".
                 "response_format": {"type": "json_object"}
             },
-            timeout=5
+            timeout=8   # generous ceiling; typical Groq latency is <1 s
         )
 
         if response.status_code != 200:
@@ -73,10 +83,21 @@ def classify_headline(headline: str):
             if _consecutive_failures >= _MAX_FAILURES:
                 _groq_disabled_until = time.time() + _COOLDOWN_SECONDS
                 print(f"[GROQ] Circuit breaker open for {_COOLDOWN_SECONDS}s.", flush=True)
-            print(f"[GROQ] HTTP {response.status_code}: {response.text[:200]}", flush=True)
+            print(f"[GROQ] HTTP {response.status_code}: {response.text[:300]}", flush=True)
             return None
 
-        content = response.json()["choices"][0]["message"]["content"].strip()
+        payload = response.json()
+        content = payload["choices"][0]["message"].get("content")
+
+        # content can be None if the model burned the whole budget on reasoning
+        if not content:
+            _consecutive_failures += 1
+            if _consecutive_failures >= _MAX_FAILURES:
+                _groq_disabled_until = time.time() + _COOLDOWN_SECONDS
+                print(f"[GROQ] Circuit breaker open for {_COOLDOWN_SECONDS}s.", flush=True)
+            print("[GROQ] Empty content — model consumed the token budget on reasoning.", flush=True)
+            return None
+
         parsed = json.loads(content)
 
         signal = str(parsed.get("signal", "")).strip().upper()
@@ -93,6 +114,14 @@ def classify_headline(headline: str):
         _consecutive_failures = 0
         print(f"[GROQ] RAW OK: {signal} strength={strength} conf={confidence:.2f}", flush=True)
         return {"signal": signal, "strength": strength, "confidence": confidence}
+
+    except json.JSONDecodeError as e:
+        _consecutive_failures += 1
+        if _consecutive_failures >= _MAX_FAILURES:
+            _groq_disabled_until = time.time() + _COOLDOWN_SECONDS
+            print(f"[GROQ] Circuit breaker open for {_COOLDOWN_SECONDS}s.", flush=True)
+        print(f"[GROQ] JSON parse failed: {e} | raw={content[:200] if 'content' in locals() else 'n/a'}", flush=True)
+        return None
 
     except Exception as e:
         _consecutive_failures += 1
