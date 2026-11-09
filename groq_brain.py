@@ -6,12 +6,15 @@ import requests
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.1-8b-instant"   # fastest Groq model, best for classification
+
+# CORRECT MODEL — llama-3.1-8b-instant was retired 2026-08-16.
+# Groq's official replacement: openai/gpt-oss-20b (free tier: 30 RPM, 1000 RPD).
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 _consecutive_failures = 0
 _groq_disabled_until = 0.0
 _MAX_FAILURES = 3
-_COOLDOWN_SECONDS = 300   # 5 minutes
+_COOLDOWN_SECONDS = 300
 
 SYSTEM_PROMPT = (
     "You are a crude oil trading analyst. You read one news headline and decide "
@@ -36,12 +39,9 @@ def classify_headline(headline: str):
     """
     Returns dict {"signal": str, "strength": int, "confidence": float}
     or None if Groq is unavailable / failed / rate-limited.
-
-    Caller MUST treat None as 'fall back to keyword engine'.
     """
     global _consecutive_failures, _groq_disabled_until
 
-    # Circuit breaker: skip Groq entirely for 5 minutes after 3 failures
     if time.time() < _groq_disabled_until:
         return None
 
@@ -65,7 +65,7 @@ def classify_headline(headline: str):
                 "max_tokens": 60,
                 "response_format": {"type": "json_object"}
             },
-            timeout=5   # hard ceiling — Groq 8B is ~50ms TTFT, 5s is generous
+            timeout=5
         )
 
         if response.status_code != 200:
@@ -73,6 +73,7 @@ def classify_headline(headline: str):
             if _consecutive_failures >= _MAX_FAILURES:
                 _groq_disabled_until = time.time() + _COOLDOWN_SECONDS
                 print(f"[GROQ] Circuit breaker open for {_COOLDOWN_SECONDS}s.", flush=True)
+            print(f"[GROQ] HTTP {response.status_code}: {response.text[:200]}", flush=True)
             return None
 
         content = response.json()["choices"][0]["message"]["content"].strip()
@@ -89,7 +90,8 @@ def classify_headline(headline: str):
         if not (0.0 <= confidence <= 1.0):
             confidence = 0.0
 
-        _consecutive_failures = 0   # reset on success
+        _consecutive_failures = 0
+        print(f"[GROQ] RAW OK: {signal} strength={strength} conf={confidence:.2f}", flush=True)
         return {"signal": signal, "strength": strength, "confidence": confidence}
 
     except Exception as e:
