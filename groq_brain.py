@@ -6,9 +6,6 @@ import requests
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-# openai/gpt-oss-20b — reasoning model. Reasoning tokens count against
-# max_completion_tokens, so it must be high enough to leave room for JSON.
 GROQ_MODEL = "openai/gpt-oss-20b"
 
 _consecutive_failures = 0
@@ -16,35 +13,74 @@ _groq_disabled_until = 0.0
 _MAX_FAILURES = 3
 _COOLDOWN_SECONDS = 300
 
-SYSTEM_PROMPT = (
-    "You are a crude oil trading analyst. You read one news headline and decide "
-    "its directional impact on Brent crude oil (BZUSDT).\n\n"
-    "Rules:\n"
-    "- If the headline is NOT about oil, energy, or geopolitics affecting crude "
-    "oil supply or demand, return signal NEUTRAL with strength 1.\n"
-    "- If it is about oil and clearly bullish, return BULL.\n"
-    "- If it is about oil and clearly bearish, return BEAR.\n"
-    "- strength 1 = normal signal.\n"
-    "- strength 2 = strong signal (large, clear, high-impact).\n"
-    "- strength 3 = extreme signal (war, embargo, major supply shock).\n"
-    "- confidence is a number between 0.0 and 1.0.\n\n"
-    "Respond with a JSON object containing exactly these keys:\n"
-    '{"signal": "BULL" | "BEAR" | "NEUTRAL", "strength": 1 | 2 | 3, '
-    '"confidence": 0.0 to 1.0}\n'
-    "No other text. JSON only."
-)
+SYSTEM_PROMPT = """You are a crude oil trading analyst. You read one news headline and decide its directional impact on Brent crude oil (BZUSDT).
+
+You must reason through the headline using the TRANSMISSION CHANNELS below. Do not classify based on keywords. Classify based on which channel the headline activates and in which direction.
+
+TRANSMISSION CHANNELS — these are the only pathways through which news affects crude oil:
+
+1. SUPPLY — physical availability of crude.
+   - Supply reduction (OPEC cut, outage, sanctions on producers, pipeline attack, force majeure) → BULLISH.
+   - Supply increase (OPEC hike, new production, reserves release, export resumption) → BEARISH.
+
+2. DEMAND — consumption of crude.
+   - Demand growth (strong economic data, stimulus, travel rebound) → BULLISH.
+   - Demand destruction (recession data, lockdown, manufacturing contraction) → BEARISH.
+
+3. GEOPOLITICAL RISK PREMIUM — the market's fear of future supply disruption.
+   - Any statement or event that raises the probability of conflict, sanctions, or supply chokepoints (Iran nuclear hardening, Strait of Hormuz threats, military escalation, tanker seizures) → BULLISH, even if no barrels have been lost yet.
+   - Any statement or event that lowers that probability (ceasefire, talks described as productive, sanctions relief, nuclear deal progress) → BEARISH.
+
+4. LOGISTICS — the movement of oil.
+   - Disruption (port closure, canal blockage, shipping embargo) → BULLISH.
+   - Restoration (route reopened, safe passage guaranteed) → BEARISH.
+
+5. CURRENCY AND MACRO — the price of oil in dollars and the cost of carrying it.
+   - Weaker dollar, falling rates, inflation hedge demand → BULLISH.
+   - Stronger dollar, rising rates → BEARISH (mild).
+
+If the headline does not activate any of these five channels, return NEUTRAL. This is the relevance test. Earnings reports, IPOs, technology company news, and domestic politics with no pathway to any channel are NEUTRAL.
+
+REASONING PROCEDURE — follow this for every headline:
+
+Step 1. Is the headline relevant to crude oil? Which channel does it activate? If none, return NEUTRAL.
+Step 2. Which direction does that channel push oil?
+Step 3. How strong is the signal?
+   - strength 1: incremental, already priced in, or from a low-authority source.
+   - strength 2: clear, from a major actor (OPEC member, US official, central bank), or a meaningful change.
+   - strength 3: extreme, from the highest authority (head of state, supreme leader, OPEC Secretariat), a first-time event, or a direct threat to physical supply.
+Step 4. How confident are you? 0.0 to 1.0. If the headline is ambiguous or the channel is indirect, confidence should be below 0.7.
+
+EXAMPLES OF GENERAL REASONING (not event-specific):
+
+Headline: "OPEC+ agrees to cut production by 2 million barrels per day."
+Reasoning: Channel 1 (supply reduction). Direction BULL. Major actor, large size → strength 3. Confidence 0.95.
+Output: {"signal": "BULL", "strength": 3, "confidence": 0.95}
+
+Headline: "Iran security chief says enriched uranium will not leave the country."
+Reasoning: Channel 3 (risk premium rise — nuclear deal probability falls). Direction BULL. High-authority source, hardens stance → strength 2. Confidence 0.85.
+Output: {"signal": "BULL", "strength": 2, "confidence": 0.85}
+
+Headline: "US and Iran agree to immediate ceasefire."
+Reasoning: Channel 3 (risk premium fade). Direction BEAR. High-authority source, major de-escalation → strength 3. Confidence 0.90.
+Output: {"signal": "BEAR", "strength": 3, "confidence": 0.90}
+
+Headline: "Take-Two Interactive Q2 earnings: revenue misses."
+Reasoning: No channel activated. Not oil-relevant. → NEUTRAL, strength 1.
+Output: {"signal": "NEUTRAL", "strength": 1, "confidence": 0.95}
+
+Headline: "China manufacturing PMI contracts for third month."
+Reasoning: Channel 2 (demand destruction). Direction BEAR. Major economy, sustained contraction → strength 2. Confidence 0.80.
+Output: {"signal": "BEAR", "strength": 2, "confidence": 0.80}
+
+OUTPUT FORMAT — respond with a JSON object containing exactly these keys:
+{"signal": "BULL" | "BEAR" | "NEUTRAL", "strength": 1 | 2 | 3, "confidence": 0.0 to 1.0}
+No other text. JSON only."""
 
 
 def classify_headline(headline: str):
-    """
-    Returns dict {"signal": str, "strength": int, "confidence": float}
-    or None if Groq is unavailable / failed / rate-limited.
-
-    Caller MUST treat None as 'fall back to keyword engine'.
-    """
     global _consecutive_failures, _groq_disabled_until
 
-    # Circuit breaker: skip Groq entirely for 5 minutes after 3 failures
     if time.time() < _groq_disabled_until:
         return None
 
@@ -64,18 +100,12 @@ def classify_headline(headline: str):
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": f"Headline: {headline}"}
                 ],
-                # Do NOT use temperature=0 — reasoning models can loop.
-                # 0.2 keeps output stable without freezing the reasoning path.
                 "temperature": 0.2,
-                # Reasoning tokens count against this budget.
-                # 60 was the old bug — it truncated the JSON.
                 "max_completion_tokens": 1024,
-                # Minimise chain-of-thought for a simple classification task.
                 "reasoning_effort": "low",
-                # JSON Object Mode — prompt already contains the word "JSON".
                 "response_format": {"type": "json_object"}
             },
-            timeout=8   # generous ceiling; typical Groq latency is <1 s
+            timeout=8
         )
 
         if response.status_code != 200:
@@ -89,7 +119,6 @@ def classify_headline(headline: str):
         payload = response.json()
         content = payload["choices"][0]["message"].get("content")
 
-        # content can be None if the model burned the whole budget on reasoning
         if not content:
             _consecutive_failures += 1
             if _consecutive_failures >= _MAX_FAILURES:
@@ -120,7 +149,7 @@ def classify_headline(headline: str):
         if _consecutive_failures >= _MAX_FAILURES:
             _groq_disabled_until = time.time() + _COOLDOWN_SECONDS
             print(f"[GROQ] Circuit breaker open for {_COOLDOWN_SECONDS}s.", flush=True)
-        print(f"[GROQ] JSON parse failed: {e} | raw={content[:200] if 'content' in locals() else 'n/a'}", flush=True)
+        print(f"[GROQ] JSON parse failed: {e}", flush=True)
         return None
 
     except Exception as e:
